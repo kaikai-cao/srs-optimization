@@ -4,8 +4,11 @@
 > `results/processed/m3_summary.csv` 与 `m3_tables.md`（汇总）。本文件只做**实测分析**，
 > 不修改 snarkjs / ffjavascript 计算逻辑。
 >
-> 验收清单全部覆盖：M3-A / M3-B / M3-C / M3-D / Prepared Verify / SHA-256/大小/退出码 /
-> 峰值工作集与耗时对照图 / 热点分析与 H1 / Git 提交。
+> 验收状态：**9/9 通过（0 项失败）**——M3-A / M3-B / M3-C / M3-D / Prepared Verify / SHA-256·大小·退出码 /
+> 峰值工作集与耗时对照图 / 热点分析与 H1 / Git 提交 全部覆盖；35 个 Rust 单元测试全绿、15 组 snarkjs 运行退出码均为 0。
+>
+> 范围声明：本 M3 解决的是 **Powers of Tau 处理流程的运行时内存画像**，不涉及 `.ptau` 文件本身的
+> 持久化压缩；减少 Prepare/Verify 的运行内存 ≠ CRS 压缩取得进展，两者须分别评价。
 
 ## 1. 测量环境与方法（指标口径）
 
@@ -22,10 +25,11 @@
 - 测量脚本：`scripts/measure_snarkjs.ps1`（独立 `node` 进程、100 ms 轮询 `PeakWorkingSet64`、
   记录退出码、输入 SHA-256、耗时、stdout/stderr 日志）；`scripts/run_m3_benchmarks.ps1` 编排矩阵；
   `scripts/timestamp_hook.cjs` 给 snarkjs 日志注入毫秒级时间戳用于分阶段耗时。
-- **口径一致性**：始终保持 **Windows Peak Working Set**，不标成「Linux Maximum RSS」。
-  该指标包含 Node 代码、V8 堆、WASM 线性内存、`fastfile` 页缓存（Node `Buffer`）、
-  `BigBuffer`/`Uint8Array` 外部内存、以及 OS 映射进进程工作集的文件页——即所有可被 snarkjs
-  真实占用的部分都已计入。
+- **口径精确化**：Windows Peak Working Set = 进程**曾驻留于物理内存的页面峰值**，含共享与私有数据；
+  不等于进程私有内存（Private Bytes / `WorkingSet64` 当前值），也不等于提交内存规模
+  （Commit Charge / `PeakPagefileUsage`），更不等于 Linux RSS。它统计物理驻留压力，而非独占内存或提交规模。
+- **本 M3 仅记录 `PeakWorkingSet64`**；M4 计划增补 `PeakPagefileUsage`（Commit Charge 峰值）以区分
+  「物理驻留压力」与「进程提交内存规模」。当前所有结论仅基于 Peak Working Set 单指标。
 - 测量了三种操作：`phase1_verify`（仅贡献关系，需 `_0001`）、`prepare_phase2`、
   `prepared_verify`（对已含 Sections 12–15 的 `*_final.ptau` 做 Phase 1 + Phase 2 Lagrange 验证）。
 - 全量原始 JSON 见 `results/raw/m3_{phase1_verify,prepare_phase2,prepared_verify}_p{10,12,14,16,18}.json`。
@@ -54,7 +58,7 @@
 | 16 | 100132 | 159799 | 48369 | 46438 |
 | 18 | 454214 | 710927 | 205378 | 217340 |
 
-各 Section 随 Power 翻倍约增长 **3.6–4.2×**，符合 `O(N·logN)` 的 FFT/MSM 量级；
+各 Section 随相邻 Power 步进（+2，即输入规模扩大 4 倍）约增长 **3.6–4.2×**，符合 `O(N·logN)` 的 FFT/MSM 量级；
 `tauG2` 与 `tauG1` 主导耗时（点更大或更密集）。
 
 ### 2.3 输入 / 输出体积
@@ -80,37 +84,51 @@
 | Power 21（外推，见 §6） | 384 MiB | 预计数 GiB | — |
 
 > Power 18 时朴素输入缓冲只有 48 MiB，实测却是 1610 MiB，说明真正的峰值由**多个大缓冲区叠加**构成，
-> 与 M3-A 审计表完全对应：`A3`（fastfile 页缓存随大 `readToBuffer` 放大到约 `1.1×len`）、
+> 与 M3-A 审计表对应：`A3`（fastfile 页缓存**容量上限**随大 `readToBuffer` 放大到约 `1.1×len`，
+> 但实际驻留取决于按需创建与 `avBuffs` 复用，**M3 未实测**）、
 > `A4`（FFT 入口 `buff.slice(0, len)` 全量复制）、`A9/A11`（FFT 输出 + MSM 分片与 WASM 中间缓冲）。
-> 单看 `2N×96` 完全低估了峰值。
+> 单看 `2N×96` 完全低估了峰值；但各项实际驻留量需 M4 直接记录才能确认。
 
 ## 4. 五个热点问题（M3-E 验收）
 
 **Q1. Phase 1 Verify 的分块策略是否真的限制了峰值？**
 是的，但只是「相对最低」。三种操作中 Phase 1 Verify 在**每个 Power 都是峰值最低的**，
-证明 `MAX_CHUNK_SIZE = 1<<16`（每 chunk 6 MiB G1 / 12 MiB G2）把逐块读入上限压住了。
-但峰值仍随 Power 上升（532→1196 MiB），原因是贡献验证需顺序读取整段 Section 2–7，
-`fastfile` 页缓存 `maxPagesLoaded` 被首次大读取永久放大（`A3`），叠加 ~450 MiB 的 Node+WASM 基线。
-结论：分块有效，但不消除增长。
+证明 `MAX_CHUNK_SIZE = 1<<16`（每 chunk 最多 6 MiB G1 / 12 MiB G2 的单次读取量）把逐块读入上限压住了。
+但峰值仍随 Power 上升（532→1196 MiB）。**这一增长不能归因于 fastfile 页缓存膨胀**：
+`processSection` 每次最多读取 `2^16` 个点，G2 单次读取仅约 12 MiB，页缓存被分块读取反复复用、
+不会随 Power 扩大到数百 MiB。更可能的驱动是 **MSM 内部缓冲、28 个 WASM worker 线性内存、以及
+`hashBlock` 等固定/准固定分配**——这部分当前测量无法精确归因（见 §7 与 M4 计划）。
+结论：分块有效（峰值最低），但不消除增长；增长来源需 M4 的分阶段/分组件记录才能定位。
 
 **Q2. Phase 2 Prepare 的 FFT 是否产生大量重复缓冲区？**
 **是，已被实测证实。** 峰值 1610 MiB 相对朴素 48 MiB 高达 33×；
-审计表 `A4/A9/A11` 的「输入副本 + FFT 输出 + MSM 分片」三套全量 384 MiB 级缓冲（p21 口径）
-在 p18 虽名义更小，但页缓存与多 Section 串行累积仍把峰值推到 1.6 GiB。
-这是本阶段**最值得优化**的对象。
+审计表 `A4/A9/A11` 的「输入副本 + FFT 输出 + MSM 分片」三套全量缓冲（p21 口径各约 384 MiB）
+在 p18 名义更小，但多 Section 串行累积 + `A3` 页缓存容量上限（实际驻留未实测）仍把峰值推到 1.6 GiB。
+这是本阶段**最值得优先研究**的对象（注意：是「优先研究」，其具体可消除量需待 M4 拆解）。
 
 **Q3. Prepared Verify 的全域 MSM 是否带来额外内存复制？**
-**是，且是三者中最严重的热点。** Prepared Verify 峰值增长最快：
-p14→p16→p18 分别为 1153→1695→**3660 MiB**（最后一步 2.16×/翻倍）。
+**是，且是三者中峰值最高的热点。** Prepared Verify 在 p18 达到 3660 MiB，为当前最高：
+p14→p16→p18 分别为 1153→1695→**3660 MiB**（每步对应输入规模 4×，峰值倍率 1.47×、2.16×）。
 审计表 `C4/C5`（verifyLagrangeEvaluations 的两次 full-domain `multiExpAffine` + Fr FFT 往返）
-在 p18 上把工作集推到 3.6 GiB。它同时做 Phase 1 贡献验证（Q1 的页缓存）+ Phase 2 Lagrange 全域 MSM，
+在 p18 上把工作集推到 3.6 GiB。它同时做 Phase 1 贡献验证（Q1 的读取路径）+ Phase 2 Lagrange 全域 MSM，
 两类大缓冲叠加，故高于单独的 Prepare。
 
-**Q4. 峰值内存是否近似随 2^k 线性增长？**
-**不是线性，是超线性（约 1.5–2.2× / 翻倍）。** 每翻一倍 Power：
-- Prepare 峰值 ×1.08→×1.27→×1.58→×1.56（高 Power 段趋近 1.5×）；
-- Prepared Verify 峰值 ×1.16→×1.61→×1.47→**×2.16**（p18 段加速）。
-说明数据相关分配（缓冲副本、页缓存、WASM 中间态）的增长快于单纯数据量 `O(N)`。
+**Q4. 峰值内存是否随数据量呈某种可推断的增长阶？**
+**当前数据不足以判定增长阶，更不能称为超线性。** 先澄清规模关系：相邻两列（p10↔p12、p12↔p14、…）
+对应的输入点数 `N=2^k` 是 **4×** 关系，而非翻倍。以实测峰值逐「4× 输入步」的倍率为：
+
+| 区间 | Phase 1 Verify | Phase 2 Prepare | Prepared Verify |
+| --- | ---: | ---: | ---: |
+| p10→p12（×4 输入） | 0.94× | 1.08× | 1.16× |
+| p12→p14（×4 输入） | 1.30× | 1.27× | 1.61× |
+| p14→p16（×4 输入） | 1.71× | 1.58× | 1.47× |
+| p16→p18（×4 输入） | 1.07× | 1.56× | 2.16× |
+
+可见：每次输入规模扩大 4 倍，峰值仅增长 **1.07–2.16×**，全部**远低于** 4×（若严格随数据量线性应为 4×），
+即增长相对数据量是**亚线性**的，主要由 ~450 MiB 的 Node+WASM 固定基线 + 数据相关分配共同决定。
+此前「超线性 / 每翻倍 1.5–2.2×」的说法不成立——既误把 4× 输入步当成翻倍，也高估了实际倍率。
+**关键限制**：固定基线占比显著，且每个 Power 仅单次测量、未做重复取中位数，
+无法据此外推渐近增长阶（线性 / 亚线性 / 超线性皆不能定论）。
 
 **Q5. 各阶段是否有明显的时间/空间交换？**
 有，且方向是「用空间换时间」：FFT/MSM 的 `Promise.all` 分块并行
@@ -142,28 +160,44 @@ p14→p16→p18 分别为 1153→1695→**3660 MiB**（最后一步 2.16×/翻�
 **建议**：H1 作为后续 M3 优化阶段的候选，但应与「缩短页缓存生命周期（`A3`）」「限制 FFT 并发分片数（`A9`）」
 合并评估——单点优化预计只能回收峰值的一小部分（约 1 份 48 MiB~384 MiB 副本），
 而页缓存与并发分片才是 p18 上 1.6–3.6 GiB 峰值的更大贡献者。
+H1 是 **M4 的候选优化之一**，须在分阶段内存拆解中与其他两项一并受测，不能在实验开始前预设其主要收益。
 
-## 6. Power 21 规模外推（仅测算，未运行）
+## 6. Power 21 规模外推（仅情景测算，未运行）
 
-按 §4 的每翻倍倍数（取保守 1.56× 与激进 2.16× 两档），从 p18 外推 3 个翻倍到 p21：
+> 重要修正：此前用「每翻倍倍数」外推、并把 p18→p21 当成 3 个翻倍，是**错误的规模关系**。
+> 实际：相邻实测列是 **4× 输入**步（p10↔p12…）；p18→p21 是 **3 个 power 步 = 输入扩大 8 倍**，
+> 相当于 **1.5 个实测步**（每个实测步覆盖 2 个 power、即 4× 输入）。
 
-| 操作 | p18 实测 | p21 外推（×1.56³） | p21 外推（×2.16³） |
+按 Q4 表中 Prepared Verify 的相邻步倍率（低档 1.47×、高档 2.16×）对 1.5 个实测步做机械外推，
+仅作**不可靠的情景上限参考**：
+
+| 操作 | p18 实测 | p21 情景测算（×1.47¹·⁵） | p21 情景测算（×2.16¹·⁵） |
 | --- | ---: | ---: | ---: |
-| Phase 1 Verify | 1196 MiB | ~4.5 GiB | ~6 GiB |
-| Phase 2 Prepare | 1610 MiB | ~6 GiB | ~16 GiB |
-| Prepared Verify | 3660 MiB | ~14 GiB | ~36 GiB |
+| Phase 1 Verify | 1196 MiB | — | — |
+| Phase 2 Prepare | 1610 MiB | — | — |
+| Prepared Verify | 3660 MiB | ~6.5 GiB | ~11.6 GiB |
 
+- **正式结论（唯一可靠表述）**：**Power 21 尚未实测，Prepared Verify 在当前 32 GiB 机器上存在较高内存压力风险**——
+  可能进入 GiB 量级高位；是否实测需在 M4 拆解与优化方案后单独决策。上述 6.5–11.6 GiB 仅是机械情景估算，**不构成预测**。
 - 磁盘：p18 `final` 输出 432 MiB；p21 预计输入 ~1.2 GiB、`final` ~2.5–3 GiB，当前 D: 盘余量充足。
-- 内存风险：p21 的 Prepared Verify 可能逼近 15–25 GiB，在当前 32 GiB 机器上**有 OOM 风险**；
-  Prepare 约 6–10 GiB，相对安全。
-- **按你的要求，本轮未运行 Power 21**；是否实测需在拿到 p18 数据与优化方案后单独决策。
+- 此前的「15–25 GiB」数字已删除：它源于错误的翻倍口径与 1.5–2.2× 倍率，不成立。
+- **按你的要求，本轮未运行 Power 21**；是否实测需在 M4 之后单独决策。
 
 ## 7. 局限与诚实声明
 
-1. **Peak Working Set ≠ Private Bytes ≠ Linux RSS**：这是 Windows 进程驻留工作集峰值，含 OS 文件缓存页；
-   与「进程独占私有内存」和「Linux RSS」口径不同，跨平台比较时必须保持本口径。
-2. **基线开销未扣除**：~450 MiB 的 Node+WASM 启动基线被计入每次峰值；数据相关增量见 §3/§4。
+1. **Peak Working Set 口径**：Windows Peak Working Set = 进程**曾驻留于物理内存的页面峰值**，含共享与私有数据；
+   不等于进程私有内存（Private Bytes），也不等于提交内存规模（Commit Charge / `PeakPagefileUsage`），
+   更不等于 Linux RSS。本 M3 **仅记录该单指标**，且**未用「含 OS 文件缓存页」来解释峰值**——
+   解释峰值应归于 MSM 内部缓冲、WASM worker 内存、fastfile 页缓存（容量上限，实际驻留未实测）等用户态分配。
+   **M4 计划增补 `PeakPagefileUsage`** 以区分「物理驻留压力」与「进程提交内存规模」。
+2. **基线开销未扣除**：~450 MiB 的 Node+WASM 启动基线被计入每次峰值；数据相关增量见 §3/§4。这使其无法作为
+   增长阶判据（见 Q4）。
 3. **分阶段耗时的精度**：Phase 2 Lagrange 耗时取自 `prepared_verify` 日志的 `Verifying phase2 calculated values`
    区间；Prepare 各 Section 耗时取自 `processSectionPower` 的 Section 级日志，均为 ms 级相对值，非 CPU 独占时间。
 4. **未触碰计算逻辑**：所有数据来自 `node`（已发布 snarkjs 0.7.6）的只读观测，未 patch 任何依赖。
 5. **样本规模**：每个 Power 各运行一次（非多次取中位数）；耗时受机器并发负载影响，峰值内存为进程级硬上限，更稳健。
+6. **范围边界**：本 M3 是 **Powers of Tau 处理流程的运行时内存画像**，**不涉及** `.ptau` 文件本身的持久化压缩；
+   减少 Prepare/Verify 的运行内存 ≠ CRS 压缩取得进展，两者须分别评价。
+7. **fastfile 页缓存实际驻留未实测**：A3 的 `maxPagesLoaded` 决定的是**页缓存容量上限**（p21 口径约 422 MiB），
+   页面按需创建并经 `avBuffs` 复用；M3 未记录 `pages`/`avBuffs` 实际字节数，故「页缓存占了多少内存」仍为开放问题，
+   留待 M4 直接测量。

@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 720" width="1040" height="720" font-family="Segoe UI, Arial, sans-serif">
+<rect x="0" y="0" width="1040" height="720" fill="#ffffff"/>
+<text x="90" y="26" font-size="18" font-weight="700" fill="#111827">M3 Powers of Tau memory baseline</text>
+<text x="980" y="26" text-anchor="end" font-size="12" fill="#6b7280">snarkjs 0.7.6 / ffjavascript 0.3.1 / Windows native</text>
+<g transform="translate(90,40)"><rect x="0" y="0" width="16" height="10" rx="2" fill="#2563eb"/><text x="22" y="10" font-size="13" fill="#374151">Phase 1 Verify</text></g><g transform="translate(320,40)"><rect x="0" y="0" width="16" height="10" rx="2" fill="#ea580c"/><text x="22" y="10" font-size="13" fill="#374151">Phase 2 Prepare</text></g><g transform="translate(550,40)"><rect x="0" y="0" width="16" height="10" rx="2" fill="#16a34a"/><text x="22" y="10" font-size="13" fill="#374151">Prepared Verify</text></g>
+<text x="90" y="76" font-size="15" font-weight="600" fill="#1f2937">Peak Working Set (MiB)</text>
+<line x1="90" y1="350.0" x2="980" y2="350.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="354.0" text-anchor="end" font-size="11" fill="#6b7280">0.0</text>
+<line x1="90" y1="285.0" x2="980" y2="285.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="289.0" text-anchor="end" font-size="11" fill="#6b7280">1025</text>
+<line x1="90" y1="220.0" x2="980" y2="220.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="224.0" text-anchor="end" font-size="11" fill="#6b7280">2050</text>
+<line x1="90" y1="155.0" x2="980" y2="155.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="159.0" text-anchor="end" font-size="11" fill="#6b7280">3074</text>
+<line x1="90" y1="90.0" x2="980" y2="90.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="94.0" text-anchor="end" font-size="11" fill="#6b7280">4099</text>
+<line x1="90" y1="90" x2="90" y2="350" stroke="#9ca3af" stroke-width="1"/>
+<line x1="90" y1="350" x2="980" y2="350" stroke="#9ca3af" stroke-width="1"/>
+<text x="90.0" y="370" text-anchor="middle" font-size="11" fill="#374151">2^10</text>
+<text x="312.5" y="370" text-anchor="middle" font-size="11" fill="#374151">2^12</text>
+<text x="535.0" y="370" text-anchor="middle" font-size="11" fill="#374151">2^14</text>
+<text x="757.5" y="370" text-anchor="middle" font-size="11" fill="#374151">2^16</text>
+<text x="980.0" y="370" text-anchor="middle" font-size="11" fill="#374151">2^18</text>
+<path d="M90.0,316.3 L312.5,318.2 L535.0,308.5 L757.5,279.1 L980.0,274.2" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="316.3" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p10: 532.07</title></circle>
+<text x="90.0" y="306.3" text-anchor="middle" font-size="10" fill="#2563eb">532</text>
+<circle cx="312.5" cy="318.2" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p12: 501.95</title></circle>
+<text x="312.5" y="308.2" text-anchor="middle" font-size="10" fill="#2563eb">502</text>
+<circle cx="535.0" cy="308.5" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p14: 654.53</title></circle>
+<text x="535.0" y="298.5" text-anchor="middle" font-size="10" fill="#2563eb">655</text>
+<circle cx="757.5" cy="279.1" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p16: 1117.60</title></circle>
+<text x="757.5" y="269.1" text-anchor="middle" font-size="10" fill="#2563eb">1118</text>
+<circle cx="980.0" cy="274.2" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p18: 1195.61</title></circle>
+<text x="980.0" y="264.2" text-anchor="middle" font-size="10" fill="#2563eb">1196</text>
+<path d="M90.0,319.9 L312.5,317.4 L535.0,308.7 L757.5,284.8 L980.0,247.9" fill="none" stroke="#ea580c" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="319.9" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p10: 475.00</title></circle>
+<text x="90.0" y="309.9" text-anchor="middle" font-size="10" fill="#ea580c">475</text>
+<circle cx="312.5" cy="317.4" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p12: 513.86</title></circle>
+<text x="312.5" y="307.4" text-anchor="middle" font-size="10" fill="#ea580c">514</text>
+<circle cx="535.0" cy="308.7" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p14: 651.12</title></circle>
+<text x="535.0" y="298.7" text-anchor="middle" font-size="10" fill="#ea580c">651</text>
+<circle cx="757.5" cy="284.8" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p16: 1028.65</title></circle>
+<text x="757.5" y="274.8" text-anchor="middle" font-size="10" fill="#ea580c">1029</text>
+<circle cx="980.0" cy="247.9" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p18: 1609.94</title></circle>
+<text x="980.0" y="237.9" text-anchor="middle" font-size="10" fill="#ea580c">1610</text>
+<path d="M90.0,310.9 L312.5,304.6 L535.0,276.9 L757.5,242.5 L980.0,117.9" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="310.9" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p10: 616.92</title></circle>
+<text x="90.0" y="300.9" text-anchor="middle" font-size="10" fill="#16a34a">617</text>
+<circle cx="312.5" cy="304.6" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p12: 715.03</title></circle>
+<text x="312.5" y="294.6" text-anchor="middle" font-size="10" fill="#16a34a">715</text>
+<circle cx="535.0" cy="276.9" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p14: 1152.50</title></circle>
+<text x="535.0" y="266.9" text-anchor="middle" font-size="10" fill="#16a34a">1153</text>
+<circle cx="757.5" cy="242.5" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p16: 1694.68</title></circle>
+<text x="757.5" y="232.5" text-anchor="middle" font-size="10" fill="#16a34a">1695</text>
+<circle cx="980.0" cy="117.9" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p18: 3660.03</title></circle>
+<text x="980.0" y="107.9" text-anchor="middle" font-size="10" fill="#16a34a">3660</text>
+<text x="90" y="416" font-size="15" font-weight="600" fill="#1f2937">Elapsed wall time (s)</text>
+<line x1="90" y1="680.0" x2="980" y2="680.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="684.0" text-anchor="end" font-size="11" fill="#6b7280">0.0</text>
+<line x1="90" y1="617.5" x2="980" y2="617.5" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="621.5" text-anchor="end" font-size="11" fill="#6b7280">445</text>
+<line x1="90" y1="555.0" x2="980" y2="555.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="559.0" text-anchor="end" font-size="11" fill="#6b7280">890</text>
+<line x1="90" y1="492.5" x2="980" y2="492.5" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="496.5" text-anchor="end" font-size="11" fill="#6b7280">1335</text>
+<line x1="90" y1="430.0" x2="980" y2="430.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="434.0" text-anchor="end" font-size="11" fill="#6b7280">1780</text>
+<line x1="90" y1="430" x2="90" y2="680" stroke="#9ca3af" stroke-width="1"/>
+<line x1="90" y1="680" x2="980" y2="680" stroke="#9ca3af" stroke-width="1"/>
+<text x="90.0" y="700" text-anchor="middle" font-size="11" fill="#374151">2^10</text>
+<text x="312.5" y="700" text-anchor="middle" font-size="11" fill="#374151">2^12</text>
+<text x="535.0" y="700" text-anchor="middle" font-size="11" fill="#374151">2^14</text>
+<text x="757.5" y="700" text-anchor="middle" font-size="11" fill="#374151">2^16</text>
+<text x="980.0" y="700" text-anchor="middle" font-size="11" fill="#374151">2^18</text>
+<path d="M90.0,679.9 L312.5,679.9 L535.0,679.8 L757.5,679.6 L980.0,678.1" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="679.9" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p10: 0.86</title></circle>
+<text x="90.0" y="669.9" text-anchor="middle" font-size="10" fill="#2563eb">0.9</text>
+<circle cx="312.5" cy="679.9" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p12: 0.96</title></circle>
+<text x="312.5" y="669.9" text-anchor="middle" font-size="10" fill="#2563eb">1.0</text>
+<circle cx="535.0" cy="679.8" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p14: 1.42</title></circle>
+<text x="535.0" y="669.8" text-anchor="middle" font-size="10" fill="#2563eb">1.4</text>
+<circle cx="757.5" cy="679.6" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p16: 2.93</title></circle>
+<text x="757.5" y="669.6" text-anchor="middle" font-size="10" fill="#2563eb">2.9</text>
+<circle cx="980.0" cy="678.1" r="4.5" fill="#2563eb" stroke="#ffffff" stroke-width="1.5"><title>m3_phase1_verify_p18: 13.44</title></circle>
+<text x="980.0" y="668.1" text-anchor="middle" font-size="10" fill="#2563eb">13.4</text>
+<path d="M90.0,679.5 L312.5,677.9 L535.0,669.2 L757.5,630.0 L980.0,456.8" fill="none" stroke="#ea580c" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="679.5" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p10: 3.64</title></circle>
+<text x="90.0" y="669.5" text-anchor="middle" font-size="10" fill="#ea580c">3.6</text>
+<circle cx="312.5" cy="677.9" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p12: 15.15</title></circle>
+<text x="312.5" y="667.9" text-anchor="middle" font-size="10" fill="#ea580c">15.2</text>
+<circle cx="535.0" cy="669.2" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p14: 77.09</title></circle>
+<text x="535.0" y="659.2" text-anchor="middle" font-size="10" fill="#ea580c">77.1</text>
+<circle cx="757.5" cy="630.0" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p16: 355.84</title></circle>
+<text x="757.5" y="620.0" text-anchor="middle" font-size="10" fill="#ea580c">355.8</text>
+<circle cx="980.0" cy="456.8" r="4.5" fill="#ea580c" stroke="#ffffff" stroke-width="1.5"><title>m3_prepare_phase2_p18: 1589.55</title></circle>
+<text x="980.0" y="446.8" text-anchor="middle" font-size="10" fill="#ea580c">1589.6</text>
+<path d="M90.0,679.8 L312.5,679.7 L535.0,679.5 L757.5,678.2 L980.0,673.9" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="90.0" cy="679.8" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p10: 1.20</title></circle>
+<text x="90.0" y="669.8" text-anchor="middle" font-size="10" fill="#16a34a">1.2</text>
+<circle cx="312.5" cy="679.7" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p12: 1.78</title></circle>
+<text x="312.5" y="669.7" text-anchor="middle" font-size="10" fill="#16a34a">1.8</text>
+<circle cx="535.0" cy="679.5" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p14: 3.69</title></circle>
+<text x="535.0" y="669.5" text-anchor="middle" font-size="10" fill="#16a34a">3.7</text>
+<circle cx="757.5" cy="678.2" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p16: 12.59</title></circle>
+<text x="757.5" y="668.2" text-anchor="middle" font-size="10" fill="#16a34a">12.6</text>
+<circle cx="980.0" cy="673.9" r="4.5" fill="#16a34a" stroke="#ffffff" stroke-width="1.5"><title>m3_prepared_verify_p18: 43.09</title></circle>
+<text x="980.0" y="663.9" text-anchor="middle" font-size="10" fill="#16a34a">43.1</text>
+<text x="535" y="710" text-anchor="middle" font-size="11" fill="#6b7280">x-axis: Powers of Tau power (N = 2^power). Peak WS = Windows PeakWorkingSet64, not Linux RSS / Private Bytes.</text>
+</svg>

@@ -147,6 +147,7 @@ $stderrTask = $proc.StandardError.ReadToEndAsync()
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 [long]$peak = 0
 [long]$wsMax = 0
+[long]$pageMax = 0
 [int]$samples = 0
 [bool]$timedOut = $false
 
@@ -157,8 +158,10 @@ do {
         $proc.Refresh()
         $v = $proc.PeakWorkingSet64
         $w = $proc.WorkingSet64
+        $p = $proc.PeakPagefileUsage
         if ($v -gt $peak) { $peak = $v }
         if ($w -gt $wsMax) { $wsMax = $w }
+        if ($p -gt $pageMax) { $pageMax = $p }
         $samples++
     } catch { }
     if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
@@ -173,6 +176,8 @@ try {
     $proc.Refresh()
     $v = $proc.PeakWorkingSet64
     if ($v -gt $peak) { $peak = $v }
+    $p = $proc.PeakPagefileUsage
+    if ($p -gt $pageMax) { $pageMax = $p }
 } catch { }
 $proc.WaitForExit()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
@@ -220,6 +225,8 @@ $result = [ordered]@{
     peak_working_set_mib       = [math]::Round($peak / 1MB, 3)
     current_ws_max_bytes       = $wsMax
     current_ws_max_mib         = [math]::Round($wsMax / 1MB, 3)
+    peak_pagefile_usage_bytes  = $pageMax
+    peak_pagefile_usage_mib    = [math]::Round($pageMax / 1MB, 3)
     peak_samples               = $samples
     poll_interval_ms           = $PollIntervalMs
     exit_code                  = $exitCode

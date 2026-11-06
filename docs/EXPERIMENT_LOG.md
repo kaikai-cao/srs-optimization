@@ -481,7 +481,8 @@ Git Bash 可以）。zip 改用系统 `tar.exe`（bsdtar）生成，细节写入
   `preparephase2.js:46-94` 的 ifft/t0/t1 整段被注释。常规 `_fft` 路径才是本项目的对象。
 - **新发现（用户未提及）**：`fastfile/src/osfile.js:285-288` 的 `readToBuffer` 会把
   `maxPagesLoaded` 永久放大到 `floor(len*1.1/pageSize)+1`；Power 21 的 384 MiB 读入会
-  额外驻留约 **422 MiB** 页缓冲（54,068 页 × 8 KiB），且 `avBuffs` 复用不归还 OS。
+  把页缓存**容量上限**放大到约 **422 MiB**（54,068 页 × 8 KiB）——这是 `maxPagesLoaded` 决定的上限，
+  页面按需创建并经 `avBuffs` 复用，**实际驻留未实测**；`avBuffs` 复用不归还 OS。
   这部分内存与 FFT 无关，改 FFT 无法消除。
 - 完整分配表 A1–A13 / B1–B6 / C1–C4 / W0–W1，标注类别（JS-EXT / JS-HEAP / WASM / PAGE）、
   是否真实复制、理论生命周期、最早可释放点；`BigBuffer.slice` 在 <1 GiB 时确实全量复制。
@@ -547,18 +548,18 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 - 矩阵完整：Power 10/12/14/16/18 ×（Phase1 Verify / Prepare / Prepared Verify）= **15 组**，全部 exit=0。
 - 关键结论：Power 18 时 Prepare 的朴素单输入缓冲仅 48 MiB（`2N×96`），实测峰值 **1610 MiB（≈33×）**；
   这证实 M3-A 审计表 `A3/A4/A9/A11` 的多缓冲叠加是真实峰值主因，`384 MiB` 估算（p21 口径）严重低估。
-  Prepared Verify 是三者最严重热点（p18 3.6 GiB，最后一步 2.16×/翻倍）。详见 `docs/MEMORY_BASELINE.md`。
+  Prepared Verify 是三者中峰值最高热点（p18 3.6 GiB，p16→p18 每步对应输入 4×、峰值倍率 2.16×）。详见 `docs/MEMORY_BASELINE.md`。
 
 ### M3-E 热点分析与 H1 判断（已完成）
 
 交付 `docs/MEMORY_BASELINE.md` + `results/processed/m3_summary.csv` + `m3_tables.md` +
 `m3_peak_vs_power.svg` + `m3_phase_timings.csv`。
 
-- 五个热点问题全部回答（分块有效性 / FFT 重复缓冲 / 全域 MSM 复制 / 超线性增长 / 时间-空间交换）。
+- 五个热点问题全部回答（分块有效性 / FFT 重复缓冲 / 全域 MSM 复制 / 增长阶推断的限制 / 时间-空间交换）。
 - **H1（consume-input FFT）方向成立但单次收益有限**：消除一次 48 MiB~384 MiB 副本只是其中一项，
   真正放大峰值的是 `A3` 页缓存与 `A9` 并发分片 + 28 线程 WASM；建议与「缩短页缓存生命周期」「限制 FFT 并发分片」
   合并评估。任何优化必须满足 `Optimized Output == Original Output`（Sections 12–15 逐字节核对 + 完整 `verify` 通过）。
-- Power 21 外推（未运行，仅测算）：Prepared Verify 峰值可能 15–25 GiB，在当前 32 GiB 机器有 OOM 风险；
+- Power 21 外推（未运行，仅情景测算）：Prepared Verify 尚未实测，在当前 32 GiB 机器存在较高内存压力风险（情景估算约 6.5–11.6 GiB，不可靠，不构成预测）；已删除原「15–25 GiB」数字。
   磁盘（~3 GiB）充足。按用户要求未跑 p20/21。
 
 ### M3 提交与 Git
@@ -576,4 +577,4 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 
 1. 「384 MiB 是 Phase 2 Prepare 峰值」→ 实测 p18 已达 1610 MiB，且 p18 朴素输入仅 48 MiB（≈33×），证明多缓冲叠加。
 2. 「Phase 1 Verify 的 65,536 分块控制了峰值」→ 成立但只是三者最低，仍随 Power 增至 1.2 GiB（页缓存 `A3` 累积）。
-3. 「Prepared Verify 只是多一次 MSM」→ 实测峰值增长最快（p18 3.6 GiB，超线性），是首要优化目标。
+3. 「Prepared Verify 只是多一次 MSM」→ 实测峰值最高（p18 3.6 GiB，但单次测量+固定基线无法判定超线性，详见基线报告 Q4），是首要优先研究目标。

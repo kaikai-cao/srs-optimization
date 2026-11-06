@@ -123,7 +123,7 @@ flowchart TD
 
   subgraph PREPARE[Phase 2 Prepare]
     A1["A1 BigBuffer(nPoints*sGin)<br/>最大 384 MiB"]
-    A3["A3 fastfile 页缓存<br/>最大约 422 MiB"]
+    A3["A3 fastfile 页缓存<br/>容量上限 ~422 MiB（实际驻留未实测）"]
     A4["A4 _fft 全量 slice 复制"]
     A6["A6 nChunks 个分片<br/>合计 384 MiB"]
     A9["A9 mix 结果 chunks[]<br/>合计 576 MiB"]
@@ -172,8 +172,8 @@ Peak Working Set；图中没有独立子进程。
 | ID | 位置（src → bundle） | 表达式 | 类别 | 是否复制 | Power 21 理论量级 | 创建时机 / 生命周期 | 最早可释放点 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | A1 | `preparephase2.js:75` → `cli.cjs:2682` | `buff = new BigBuffer(nPoints*sGin)` | JS-EXT | alloc | 384 MiB（G1 p=22 / G2 p=21） | 每个 `processSectionPower(p)` 开头；变量在 `buff = await ...` 赋值前一直被 caller 持有 | `lagrangeEvaluations` 返回、caller 完成赋值后（`buff` 旧值失去引用，实际回收取决于 GC） |
-| A2 | `preparephase2.js:79,82` → `cli.cjs:2686,2689` | `fdOld.readToBuffer(buff, 0, nPoints*sGin)` | PAGE | 读入（每页 `dstView.set(srcView)` 复制） | 目标 384 MiB + 页缓存约 422 MiB | 读 Section 期间 | `endReadSection` 后 `fd.pages` 仍持有 `maxPagesLoaded` 个页缓冲，直到 `fdOld.close()` |
-| A3 | `fastfile/src/osfile.js:285-288` | `if (len > pageSize*maxPagesLoaded*0.8) maxPagesLoaded = floor(len*1.1/pageSize)+1` | PAGE | alloc（每页 8 KiB） | **`≈422 MiB`**（`floor(402,653,088*1.1/8192)+1 = 54,068` 页 × 8 KiB = 442,925,056 B） | 首次大 `readToBuffer` 时把 `maxPagesLoaded` 从 9 永久放大 | 只靠 `fd.close()`；`_triggerLoad` 把淘汰页放进 `avBuffs` **复用**，不会把内存还给 OS |
+| A2 | `preparephase2.js:79,82` → `cli.cjs:2686,2689` | `fdOld.readToBuffer(buff, 0, nPoints*sGin)` | PAGE | 读入（每页 `dstView.set(srcView)` 复制） | 目标 384 MiB + 页缓存容量上限约 422 MiB（实际驻留未实测） | 读 Section 期间 | `endReadSection` 后 `fd.pages` 仍持有 `maxPagesLoaded` 个页缓冲，直到 `fdOld.close()` |
+| A3 | `fastfile/src/osfile.js:285-288` | `if (len > pageSize*maxPagesLoaded*0.8) maxPagesLoaded = floor(len*1.1/pageSize)+1` | PAGE | alloc（每页 8 KiB） | **`≈422 MiB`（容量上限）**（`floor(402,653,088*1.1/8192)+1 = 54,068` 页 × 8 KiB = 442,925,056 B） | 首次大 `readToBuffer` 时把 `maxPagesLoaded` 从 9 永久放大 | 只靠 `fd.close()`；`_triggerLoad` 把淘汰页放进 `avBuffs` **复用**，不会把内存还给 OS；**实际驻留取决于按需创建与复用，M3 未实测** |
 | A4 | `engine_fft.js:73` → `main.cjs:5088` | `buff = buff.slice(0, buff.byteLength)` | JS-EXT | **copy（全量）** | 384 MiB | `_fft` 入口；保护调用方数据不被 `buffReverseBits` 原地打乱 | `_fft` 返回后；但调用方的 A1 直到赋值完成才释放，两者**同时存活** |
 | A5 | `utils.js:216-230` → `main.cjs` 同函数 | `buffReverseBits(buff, sIn)` | JS-EXT | 原地交换，每元素两次 96/192 B `slice()` | 峰值增量可忽略（每元素小临时块） | A4 之后立即执行 | 立即 |
 | A6 | `engine_fft.js:124` → `main.cjs:5139` | `buffChunk = buff.slice(i*chunk*sIn, ...)` × `nChunks` | JS-EXT | **copy（分片全量）** | G1 p=22：256 × 1.5 MiB = **384 MiB** | `for i in 0..nChunks` 中**全部先创建**并随 task 一起入队 | task 被 worker 消费后（但 `promises[]` / `queueAction` 仍持有引用直到 `Promise.all` 完成） |
@@ -225,7 +225,7 @@ Peak Working Set；图中没有独立子进程。
 | OS 文件页缓存（内核） | 内核，不属于进程 | 否 | 部分计入工作集（共享 / 映射页），**不可与用户态缓冲简单相加** |
 
 因此「384 MiB 输入缓冲区」**不是**峰值内存。仅 Prepare 的第一层就有：
-A1(384) + A2/A3 页缓存(≈422) + A4 全量复制(384) + A6 分片(384) + A9 mix 输出(576)
+A1(384) + A2/A3 页缓存容量上限(≈422) + A4 全量复制(384) + A6 分片(384) + A9 mix 输出(576)
 + A10 join 输出(576) + A11 输出(384) + W1(≥45) ≈ **3.1 GiB 量级的活跃用户态数据**，
 且这些缓冲的存活区间由 GC 决定，可能叠加而非顺序替换。这个数字是**理论推导，不是实测**，
 M3-D 的任务就是用 Peak Working Set 给出真实答案。
@@ -244,7 +244,7 @@ M3-D 的任务就是用 Peak Working Set 给出真实答案。
 
 * `Promise.all(promises)`（A6/A9）与 `Promise.all(opPromises)`（A10）让**同一批全部分片同时存活**，
   这是比单次全量复制更值得注意的峰值来源；
-* `fastfile` 的 `avBuffs` 复用机制让 A3 的 54,067 个页缓冲在 `fd` 生命周期内一直驻留；
+* `fastfile` 的 `avBuffs` 复用机制让 A3 的页缓冲在 `fd` 生命周期内持续持有（容量上限约 422 MiB，实际驻留随按需创建与复用而定，M3 未实测）；
 * `tm.singleThread` 为 false，28 个 worker 的 WASM 内存各自增长且互不共享。
 
 ## 7. H1（consume-input FFT）的源码级前置判断
@@ -264,7 +264,7 @@ M3-D 的任务就是用 Peak Working Set 给出真实答案。
 去掉 A4 那一次 384 MiB 全量复制是安全的，但按第 5 节的量级，A6/A9/A10/A11 才是更大的项。
 「只消除一次输入复制」很可能只降低峰值的很小一部分；真正的热点取决于
 `Promise.all` 同时持有多少分片，以及 GC 是否及时回收上一轮 join 的 576 MiB。
-另外 A3 的 fastfile 页缓存增长（≈422 MiB）完全独立于 FFT，改 FFT 不会动它。
+另外 A3 的 fastfile 页缓存容量上限（≈422 MiB）完全独立于 FFT，但实际驻留未实测、改 FFT 也不会动它。
 
 因此 H1 若要成立，至少需要同时处理：**分片生命周期**（流式派发而不是一次性
 `Promise.all`）、**join 级结果复用**、**输出别名**，并给出
