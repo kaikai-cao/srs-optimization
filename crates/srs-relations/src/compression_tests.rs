@@ -1,5 +1,11 @@
+//! M2-B recovery algorithms (R2 revision: P0/Q0 are implicit public generators).
+//!
+//! This module belongs to the library that the INDEPENDENT `recover` process
+//! links. It contains no trapdoor generation and no full Tau-G1 oracle. Its
+//! only input is `CompressedParameters`: a public SCP1 file plus public
+//! auxiliary parameters.
+
 use crate::pairing::{Gt, pairing_g1_g2};
-use crate::powers::TestSrs;
 use ark_bls12_381::{Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
 use ark_ff::PrimeField;
@@ -8,13 +14,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 const FILE_MAGIC: &[u8; 4] = b"SCP1";
 
 /// Public, compressed parameter subset. Contains NO trapdoor scalars and NO
-/// complete Tau-G1 array. The Tau-G1 points live only in `file_path`.
-/// Some fields are metadata kept for reporting / reproducibility.
+/// complete Tau-G1 array. The saved Tau-G1 points live only in `file_path`.
 #[allow(dead_code)]
 pub struct CompressedParameters {
     pub scheme: &'static str,
@@ -28,15 +32,25 @@ pub struct CompressedParameters {
     pub beta_g2: G2Affine,
 }
 
-/// Diagnostic counters from one recovery attempt; some fields are recorded for
-/// reproducibility even when the harness does not print them.
-#[allow(dead_code)]
+impl CompressedParameters {
+    /// P0 = [1]G1 is a PUBLIC constant (snarkjs powersoftau_verify.js:182).
+    pub fn p0() -> G1Affine {
+        G1Affine::generator()
+    }
+    /// Q0 = [1]G2 is a PUBLIC constant (powersoftau_verify.js:201).
+    pub fn q0() -> G2Affine {
+        G2Affine::generator()
+    }
+}
+
+/// Diagnostic counters from one recovery attempt.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecoveryStats {
     pub sequence_len: usize,
     pub saved: usize,
     pub missing: usize,
     pub gt_targets: usize,
+    pub implicit_generator_filled: usize,
     pub candidates: usize,
     pub aux_relations_checked: usize,
     pub recovered: usize,
@@ -45,6 +59,18 @@ pub struct RecoveryStats {
 #[derive(Debug, Clone)]
 pub struct RecoveryError {
     pub stats: RecoveryStats,
+    pub reason: String,
+    /// Points recovered so far (Some = determined, None = still missing).
+    /// The evaluator uses this to score partial recovery.
+    pub partial_points: Vec<Option<G1Affine>>,
+}
+
+/// Full diagnostic output of a recovery attempt.
+#[derive(Debug, Clone)]
+pub struct RecoveryOutcome {
+    pub points: Vec<Option<G1Affine>>,
+    pub stats: RecoveryStats,
+    pub success: bool,
     pub reason: String,
 }
 
@@ -69,25 +95,7 @@ pub const SCHEMES: [(&str, Scheme); 7] = [
     ("every_8", Scheme::Step8),
 ];
 
-#[derive(Debug, Clone)]
-pub struct ExperimentResult {
-    pub scheme: &'static str,
-    pub saved_points: usize,
-    pub file_bytes: u64,
-    pub storage_reduction_pct: f64,
-    pub missing_points: usize,
-    pub gt_targets_computed: usize,
-    pub candidates_tested: usize,
-    pub aux_relations_checked: usize,
-    pub recovered_points: usize,
-    pub recovery_success: bool,
-    pub point_equality: &'static str,
-    pub recovery_ms: f64,
-    pub failure_stage: &'static str,
-    pub recovery_reason: String,
-}
-
-fn selected_indices(scheme: Scheme, seq_len: usize, n: usize) -> Vec<usize> {
+pub fn selected_indices(scheme: Scheme, seq_len: usize, n: usize) -> Vec<usize> {
     match scheme {
         Scheme::All => (0..seq_len).collect(),
         Scheme::Odd => (0..seq_len).filter(|i| i % 2 == 1).collect(),
@@ -104,11 +112,11 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// File layout: magic(4) | sequence_len u32 | count u32 |
+/// SCP1 layout: magic(4) | sequence_len u32 | count u32 |
 ///              count x [ index u32 | 96 B uncompressed arkworks G1Affine ].
-/// NOTE: arkworks canonical serialization is NOT the same as snarkjs LEM/Montgomery
-/// encoding. These files are M2-only mathematical fixtures, not .ptau fragments.
-fn write_compressed_file(
+/// NOTE: arkworks canonical serialization is NOT the same as snarkjs
+/// LEM/Montgomery encoding. These are M2-only mathematical fixtures.
+pub fn write_compressed_file(
     path: &Path,
     seq_len: usize,
     saved: &[(usize, G1Affine)],
@@ -159,12 +167,16 @@ fn add_candidate(p: G1Affine, seen: &mut HashSet<Vec<u8>>, out: &mut Vec<G1Affin
 }
 
 /// Build a bounded search space of G1 points obtainable with PUBLIC operations:
-/// integer linear combinations of saved points, doubling/negation, and small
-/// known scalar multiples of the generator.
+/// integer linear combinations of saved points, doubling/negation, the implicit
+/// public generator P0, other public G1 families, and small known scalar
+/// multiples of the generator.
 fn build_candidates(saved: &[(usize, G1Affine)], pp: &CompressedParameters) -> Vec<G1Affine> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let g1_gen = G1Projective::generator();
+
+    // R2: P0 = G1 is public even when it was not stored in the compressed file.
+    add_candidate(CompressedParameters::p0(), &mut seen, &mut out);
 
     for (_, p) in saved {
         let proj = p.into_group();
@@ -184,8 +196,6 @@ fn build_candidates(saved: &[(usize, G1Affine)], pp: &CompressedParameters) -> V
         }
     }
 
-    // Also try the other public G1 families (alpha*tau^i, beta*tau^i) and their
-    // doubles: they are legitimate public inputs to any recovery attempt.
     for family in [&pp.alpha_tau_g1, &pp.beta_tau_g1] {
         for p in family {
             let proj = p.into_group();
@@ -207,79 +217,122 @@ fn build_candidates(saved: &[(usize, G1Affine)], pp: &CompressedParameters) -> V
 
 /// Recover the full Tau-G1 sequence using ONLY the compressed public parameters.
 ///
-/// Allowed: group law on saved G1 points, known scalar multiplication, G2 points,
-/// bilinear pairings, and publicly computable auxiliary values.
+/// Allowed: group law on saved G1 points, known scalar multiplication, the
+/// implicit public generators P0/Q0, G2 points, bilinear pairings, and publicly
+/// computable auxiliary values.
 /// Forbidden (by construction): tau / alpha / beta, and the original full array.
 ///
 /// Strategy:
 ///  1. Fill indices already present in the compressed file.
-///  2. For each missing k, compute a GT target t_k = e(P_i, Q_{k-i}) whenever a
-///     saved index i and a legal G2 index j = k-i exist (M2-A verified identity).
-///  3. Build a bounded candidate set of G1 points reachable by public operations.
+///  1b (R2). Fill index 0 with the PUBLIC generator P0 when it is missing.
+///  2  (R2). Build GT targets from all public sources INCLUDING (0, P0), so
+///           for 0<=k<N we can always use e(P_0,Q_k)=e(P_k,Q_0).
+///  3. Build a bounded candidate set of G1 points reachable by public ops.
 ///  4. Try to invert e(., Q_0): G1 -> GT by looking up t_k among candidate images.
-///  5. Any G1 point found is re-verified with a pairing and compared afterwards.
+///  5. Re-verify any hit with a pairing; the evaluator compares points afterwards.
 ///
 /// A GT target alone is NOT a recovered G1 point. If inversion fails, the whole
 /// recovery is reported as failed.
-pub fn recover_missing_powers(
-    public_parameters: &CompressedParameters,
-) -> Result<Vec<G1Affine>, RecoveryError> {
-    let (seq_len, saved) =
-        read_saved_from_file(&public_parameters.file_path).map_err(|e| RecoveryError {
+pub fn recover_with_diagnostics(pp: &CompressedParameters) -> RecoveryOutcome {
+    let (seq_len, saved) = match read_saved_from_file(&pp.file_path) {
+        Ok(v) => v,
+        Err(e) => {
+            return RecoveryOutcome {
+                points: Vec::new(),
+                stats: RecoveryStats::default(),
+                success: false,
+                reason: format!("cannot read compressed file: {}", e),
+            };
+        }
+    };
+
+    let q0 = CompressedParameters::q0();
+    if pp.tau_g2.first() != Some(&q0) {
+        return RecoveryOutcome {
+            points: Vec::new(),
             stats: RecoveryStats::default(),
-            reason: format!("cannot read compressed file: {}", e),
-        })?;
+            success: false,
+            reason: "public Q0 does not equal the standard G2 generator".to_string(),
+        };
+    }
 
     let mut present: HashMap<usize, G1Affine> = HashMap::new();
     for (i, p) in &saved {
         present.insert(*i, *p);
     }
-    let missing: Vec<usize> = (0..seq_len).filter(|i| !present.contains_key(i)).collect();
+    let saved_count = saved.len();
     let mut result: Vec<Option<G1Affine>> =
         (0..seq_len).map(|i| present.get(&i).copied()).collect();
+    let missing: Vec<usize> = (0..seq_len).filter(|i| result[*i].is_none()).collect();
 
     if missing.is_empty() {
-        return Ok(result.into_iter().map(Option::unwrap).collect());
+        return RecoveryOutcome {
+            points: result,
+            stats: RecoveryStats {
+                sequence_len: seq_len,
+                saved: saved_count,
+                missing: 0,
+                gt_targets: 0,
+                implicit_generator_filled: 0,
+                candidates: 0,
+                aux_relations_checked: 0,
+                recovered: seq_len,
+            },
+            success: true,
+            reason: "n/a (baseline, no missing points)".to_string(),
+        };
     }
 
-    // Step 2: GT targets from the tau-powers pairing identity.
+    // Step 1b: P0 = G1 is an implicit PUBLIC parameter, not an unknown point.
+    let mut implicit_generator_filled = 0usize;
+    if !present.contains_key(&0) {
+        result[0] = Some(CompressedParameters::p0());
+        implicit_generator_filled = 1;
+    }
+
+    // Step 2: public sources for GT targets include (0, P0).
+    let mut available: Vec<(usize, G1Affine)> = saved.clone();
+    if !present.contains_key(&0) {
+        available.push((0, CompressedParameters::p0()));
+    }
     let mut targets: Vec<(usize, Gt)> = Vec::new();
     for &k in &missing {
-        for (i, p) in &saved {
+        for (i, p) in &available {
             if *i <= k {
                 let j = k - *i;
-                if j < public_parameters.tau_g2.len() {
-                    targets.push((k, pairing_g1_g2(*p, public_parameters.tau_g2[j])));
+                if j < pp.tau_g2.len() {
+                    targets.push((k, pairing_g1_g2(*p, pp.tau_g2[j])));
                     break;
                 }
             }
         }
     }
 
-    let q0 = public_parameters.tau_g2[0];
-
     // Cross-check the beta family on public data: e(B_i, Q_0) = e(P_i, B_2).
-    // This uses the auxiliary G2 element, but still produces only GT elements.
     let mut aux_relations_checked = 0usize;
     for (i, p) in &saved {
-        if *i < public_parameters.n && *i < public_parameters.beta_tau_g1.len() {
-            let lhs = pairing_g1_g2(public_parameters.beta_tau_g1[*i], q0);
-            let rhs = pairing_g1_g2(*p, public_parameters.beta_g2);
+        if *i < pp.n && *i < pp.beta_tau_g1.len() {
+            let lhs = pairing_g1_g2(pp.beta_tau_g1[*i], q0);
+            let rhs = pairing_g1_g2(*p, pp.beta_g2);
             if lhs == rhs {
                 aux_relations_checked += 1;
             }
         }
     }
-    // Step 3 & 4: bounded GT -> G1 inversion over publicly constructible points.
-    let candidates = build_candidates(&saved, public_parameters);
+
+    // Steps 3 & 4: bounded GT -> G1 inversion over publicly constructible points.
+    let candidates = build_candidates(&saved, pp);
     let mut gt_map: HashMap<Gt, G1Affine> = HashMap::new();
     for x in &candidates {
         let image = pairing_g1_g2(*x, q0);
         gt_map.entry(image).or_insert(*x);
     }
 
-    let mut recovered = 0usize;
+    let mut recovered = implicit_generator_filled;
     for (k, t) in &targets {
+        if result[*k].is_some() {
+            continue; // already determined as the public generator
+        }
         if let Some(x) = gt_map.get(t) {
             if pairing_g1_g2(*x, q0) == *t {
                 result[*k] = Some(*x);
@@ -288,31 +341,53 @@ pub fn recover_missing_powers(
         }
     }
 
+    let success = result.iter().all(Option::is_some);
     let stats = RecoveryStats {
         sequence_len: seq_len,
-        saved: saved.len(),
+        saved: saved_count,
         missing: missing.len(),
         gt_targets: targets.len(),
+        implicit_generator_filled,
         candidates: candidates.len(),
         aux_relations_checked,
         recovered,
     };
-
-    if result.iter().any(Option::is_none) {
-        Err(RecoveryError {
-            stats,
-            reason: "pairing yields GT elements only; GT -> G1 inversion requires solving \
-                     the discrete log of tau^k, which is not a known public scalar"
-                .to_string(),
-        })
+    let reason = if success {
+        "n/a".to_string()
     } else {
-        Ok(result.into_iter().map(Option::unwrap).collect())
+        "pairing yields GT elements only; GT -> G1 inversion requires solving \
+         the discrete log of tau^k, which is not a known public scalar"
+            .to_string()
+    };
+    RecoveryOutcome {
+        points: result,
+        stats,
+        success,
+        reason,
     }
 }
 
-/// Positive control: when the hidden exponent IS a small known integer, the same
-/// bounded GT -> G1 inversion succeeds. This proves the failure above is caused
-/// by the unknown exponent, not by a broken pairing/verification implementation.
+/// The recovery contract requested in the experiment plan. It deliberately
+/// accepts ONLY public parameters; no trapdoor and no full original array.
+pub fn recover_missing_powers(
+    public_parameters: &CompressedParameters,
+) -> Result<Vec<G1Affine>, RecoveryError> {
+    let o = recover_with_diagnostics(public_parameters);
+    if o.success {
+        Ok(o.points.into_iter().map(Option::unwrap).collect())
+    } else {
+        Err(RecoveryError {
+            stats: o.stats,
+            reason: o.reason,
+            partial_points: o.points,
+        })
+    }
+}
+
+/// FUNCTIONAL TEST (positive control): when the hidden exponent IS a small
+/// known integer, the same bounded GT -> G1 inversion succeeds. This only shows
+/// that the pairing/lookup machinery works; it does NOT prove any general
+/// correctness of an unknown-exponent recovery algorithm.
 pub fn control_known_scalar(q0: G2Affine) -> (bool, u64, usize) {
     let g1_gen = G1Projective::generator();
     let hidden = g1_gen
@@ -328,86 +403,37 @@ pub fn control_known_scalar(q0: G2Affine) -> (bool, u64, usize) {
     (false, 0, 64)
 }
 
-pub fn run_all(srs: &TestSrs, out_dir: &Path) -> Vec<ExperimentResult> {
-    fs::create_dir_all(out_dir).expect("create compression output dir");
-    let seq_len = 2 * srs.n - 1;
-    // Kept in the harness ONLY as a comparison oracle; never passed to recovery.
-    let original = srs.tau_g1.clone();
-    let mut results = Vec::new();
-    let baseline_bytes = 12u64 + (seq_len as u64) * 100;
-
-    for (name, scheme) in SCHEMES {
-        let indices = selected_indices(scheme, seq_len, srs.n);
-        let saved: Vec<(usize, G1Affine)> = indices.iter().map(|i| (*i, srs.tau_g1[*i])).collect();
-        let file_path = out_dir.join(format!("{}.bin", name));
-        let file_bytes = write_compressed_file(&file_path, seq_len, &saved)
-            .expect("write compressed parameter file");
-        // The full array is deliberately not copied into `pp`.
-        drop(saved);
-
-        let pp = CompressedParameters {
-            scheme: name,
-            n: srs.n,
-            file_path,
-            file_bytes,
-            tau_g2: srs.tau_g2.clone(),
-            alpha_tau_g1: srs.alpha_tau_g1.clone(),
-            beta_tau_g1: srs.beta_tau_g1.clone(),
-            beta_g2: srs.beta_g2,
-        };
-
-        let start = Instant::now();
-        let attempt = recover_missing_powers(&pp);
-        let recovery_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        let (recovery_success, point_equality, stats, failure_stage, recovery_reason) =
-            match attempt {
-                Ok(recovered) => {
-                    let equal = recovered.len() == original.len()
-                        && recovered.iter().zip(&original).all(|(a, b)| a == b);
-                    (
-                        true,
-                        if equal { "PASS" } else { "FAIL" },
-                        RecoveryStats {
-                            sequence_len: seq_len,
-                            saved: indices.len(),
-                            missing: seq_len - indices.len(),
-                            gt_targets: 0,
-                            candidates: 0,
-                            aux_relations_checked: 0,
-                            recovered: recovered.len(),
-                        },
-                        "n/a (baseline, no missing points)",
-                        "n/a".to_string(),
-                    )
-                }
-                Err(e) => (
-                    false,
-                    "N/A",
-                    e.stats,
-                    "GT -> G1 inversion (recovering an unknown tau^k exponent)",
-                    e.reason,
-                ),
-            };
-
-        results.push(ExperimentResult {
-            scheme: name,
-            saved_points: indices.len(),
-            file_bytes,
-            storage_reduction_pct: (1.0 - file_bytes as f64 / baseline_bytes as f64) * 100.0,
-            missing_points: seq_len - indices.len(),
-            gt_targets_computed: stats.gt_targets,
-            candidates_tested: stats.candidates,
-            aux_relations_checked: stats.aux_relations_checked,
-            recovered_points: stats.recovered,
-            recovery_success,
-            point_equality,
-            recovery_ms,
-            failure_stage,
-            recovery_reason,
-        });
-    }
-    results
+/// Final per-scheme record assembled by the independent evaluator (R3 fields).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ExperimentResult {
+    pub scheme: &'static str,
+    pub saved_points: usize,
+    pub missing_points: usize,
+    pub scp1_bytes: u64,
+    pub native_tau_g1_section_bytes: u64,
+    pub scp1_baseline_bytes: u64,
+    pub native_aux_bytes: u64,
+    pub native_full_crs_bytes: u64,
+    pub tau_g1_representation_saving_pct: f64,
+    pub scp1_baseline_reduction_pct: f64,
+    pub full_crs_bytes: u64,
+    pub full_crs_reduction_pct: f64,
+    pub implicit_generator_filled: usize,
+    pub gt_targets_computed: usize,
+    pub gt_target_coverage_pct: f64,
+    pub candidates_tested: usize,
+    pub aux_relations_checked: usize,
+    /// Points newly obtained for indices that were MISSING from the compressed
+    /// file (implicit P0 + successful GT->G1 inversions). NOT the saved points.
+    pub recovered_points: usize,
+    /// Total determined points in the result array = saved + recovered_points.
+    pub determined_points: usize,
+    pub recovery_success: bool,
+    pub point_equality: String,
+    pub recovery_ms: f64,
+    pub failure_stage: &'static str,
+    pub recovery_reason: String,
 }
 
 #[cfg(test)]
@@ -415,31 +441,67 @@ mod tests {
     use super::*;
     use crate::powers;
 
+    fn pp_for(
+        dir: &Path,
+        name: &'static str,
+        n: usize,
+        srs: &powers::TestSrs,
+        saved: &[(usize, G1Affine)],
+    ) -> CompressedParameters {
+        fs::create_dir_all(dir).unwrap();
+        let seq_len = 2 * n - 1;
+        let path = dir.join(format!("{}.bin", name));
+        let bytes = write_compressed_file(&path, seq_len, saved).unwrap();
+        CompressedParameters {
+            scheme: name,
+            n,
+            file_path: path,
+            file_bytes: bytes,
+            tau_g2: srs.tau_g2.clone(),
+            alpha_tau_g1: srs.alpha_tau_g1.clone(),
+            beta_tau_g1: srs.beta_tau_g1.clone(),
+            beta_g2: srs.beta_g2,
+        }
+    }
+
     #[test]
     fn baseline_recovers_all_points_exactly() {
-        let (_, srs) = powers::generate(4);
-        let dir = std::env::temp_dir().join(format!("srs_m2_{}", std::process::id()));
-        let r = run_all(&srs, &dir);
-        assert!(r[0].recovery_success);
-        assert_eq!(r[0].point_equality, "PASS");
-        assert_eq!(r[0].saved_points, 7);
+        let (_, srs) = powers::generate_for_tests(4);
+        let dir = std::env::temp_dir().join(format!("srs_m2r1_{}", std::process::id()));
+        let seq_len = 2 * srs.n - 1;
+        let saved: Vec<(usize, G1Affine)> = (0..seq_len).map(|i| (i, srs.tau_g1[i])).collect();
+        let pp = pp_for(&dir, "all", srs.n, &srs, &saved);
+        let recovered = recover_missing_powers(&pp).unwrap();
+        assert_eq!(recovered, srs.tau_g1);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn odd_only_and_first_half_fail_to_recover() {
-        let (_, srs) = powers::generate(8);
-        let dir = std::env::temp_dir().join(format!("srs_m2b_{}", std::process::id()));
-        let r = run_all(&srs, &dir);
-        assert!(!r[1].recovery_success);
-        assert!(!r[3].recovery_success);
-        assert_eq!(r[1].recovered_points, 0);
+    fn odd_only_fills_implicit_generator_and_still_fails() {
+        let (_, srs) = powers::generate_for_tests(8);
+        let dir = std::env::temp_dir().join(format!("srs_m2r2_{}", std::process::id()));
+        let seq_len = 2 * srs.n - 1;
+        let indices = selected_indices(Scheme::Odd, seq_len, srs.n);
+        let saved: Vec<(usize, G1Affine)> = indices.iter().map(|i| (*i, srs.tau_g1[*i])).collect();
+        let pp = pp_for(&dir, "odd", srs.n, &srs, &saved);
+        let out = recover_with_diagnostics(&pp);
+
+        assert!(!out.success);
+        assert_eq!(out.stats.missing, 8);
+        // R2: P0 is public, so it is determined even though it was not saved.
+        assert_eq!(out.stats.implicit_generator_filled, 1);
+        assert_eq!(out.points[0], Some(CompressedParameters::p0()));
+        // R2: GT target coverage is now 8/8 (was 7/8 before the fix).
+        assert_eq!(out.stats.gt_targets, out.stats.missing);
+        assert_eq!(out.stats.recovered, 1);
+        assert!(out.points[1].is_some()); // P1 was saved in odd_only
+        assert!(out.points[2].is_none()); // an even missing point is NOT recovered
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn control_with_known_small_exponent_succeeds() {
-        let (_, srs) = powers::generate(4);
+    fn bounded_small_scalar_search_functional_test_passes() {
+        let (_, srs) = powers::generate_for_tests(4);
         let (ok, c, tried) = control_known_scalar(srs.tau_g2[0]);
         assert!(ok);
         assert_eq!(c, 7);
@@ -448,8 +510,8 @@ mod tests {
 
     #[test]
     fn compressed_file_roundtrip() {
-        let (_, srs) = powers::generate(4);
-        let dir = std::env::temp_dir().join(format!("srs_m2c_{}", std::process::id()));
+        let (_, srs) = powers::generate_for_tests(4);
+        let dir = std::env::temp_dir().join(format!("srs_m2r3_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("roundtrip.bin");
         let saved: Vec<(usize, G1Affine)> = vec![(1, srs.tau_g1[1]), (3, srs.tau_g1[3])];
@@ -458,5 +520,12 @@ mod tests {
         assert_eq!(seq, 7);
         assert_eq!(back, saved);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn q0_is_the_public_generator() {
+        let (_, srs) = powers::generate_for_tests(4);
+        assert_eq!(srs.tau_g2[0], CompressedParameters::q0());
+        assert_eq!(srs.tau_g1[0], CompressedParameters::p0());
     }
 }

@@ -338,3 +338,115 @@ Total relation checks: 2080 (4160 pairings)
 
 `results/raw/m2_results.json`、`results/raw/compression/*.bin`（均被 `.gitignore` 排除，
 未提交）。`cargo test -p srs-relations` 9 个单元测试全部通过。
+
+> **以下为 R1–R4 修订前的原始记录，保留不删。固定种子、旧 `storage_reduction_pct`
+> 口径与旧表数值均以「R1–R4 修订」节及 `COMPRESSION_EXPERIMENTS.md` 新版为准。**
+
+---
+
+## R1–R4 修订批次 — M2 实验前提与统计口径（2026-11-06）
+
+用户远端复核 `6594cb7` 后的验收结论：**M1 通过并冻结 / M2-A 通过并冻结 /
+M2-B 需要修订**。核心问题是 `powers.rs` 的 `pub const SRS_SEED` 把生成
+$\tau,\alpha,\beta$ 的固定种子公开在 GitHub 上，任何人都能重建陷门并直接算出
+缺失点，因此旧结论只能证明「恢复函数被限制为只用 CompressedParameters 时，
+当前候选构造策略失败」，不能证明「不知道陷门的攻击者无法恢复」。
+另需修正 $P_0/Q_0$ 公开生成元处理与存储统计口径。
+
+### 新增依赖（已锁定于 `Cargo.lock`）
+
+| crate | 版本 | 用途 |
+| --- | --- | --- |
+| `getrandom` | 0.2.17 | OS 熵生成正式实验种子（ark-std 的 rand 是 `default-features=false`，无 `OsRng`） |
+| `serde_json` | 1.0.154 | manifest / summary / relations / m2_results 的 JSON 读写 |
+| `serde` / `serde_core` / `serde_derive` | 1.0.229 | serde_json 传递依赖 |
+| `itoa` 1.0.18 / `memchr` 2.8.3 / `zmij` 1.0.23 / `wasi` 0.11.1 / `libc` 0.2.191 | — | 传递依赖 |
+
+SHA-256 未引入新依赖：`src/sha256.rs` 为纯标准库实现（1 MiB 分块流式），
+带 3 个标准向量 + 分块边界单测，与 `ptau-audit::report` 的 K 常量逐行一致。
+
+### 源码变更
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/powers.rs` | 删除 `pub const SRS_SEED`；新增 `generate_from_os_entropy()`；固定种子改名 `TEST_SEED` 并移入 `#[cfg(test)]`；新增 OS 熵路径单测 |
+| `src/lib.rs`（新） | 库入口，暴露 `powers/pairing/public_io/compression_tests/sha256`；写明三进程安全模型 |
+| `src/public_io.rs`（新） | 三阶段文件协议（aux / SCP1 / oracle / recovered / manifest）+ R3 三种统计口径 + 公开数据集 SHA-256 |
+| `src/sha256.rs`（新） | 纯标准库 SHA-256（分块流式） |
+| `src/compression_tests.rs` | R2：$P_0/Q_0$ 隐式公开常量、自动填充 index 0、GT 目标来源加入 $(0,P_0)$；新增 `RecoveryOutcome`/`recover_with_diagnostics`；`recover_missing_powers` 签名保持不变；移除 `run_all`；R3 字段 |
+| `src/main.rs` | 改为 `gen` / `eval` 两个阶段（独立进程），generator 写公开文件+oracle，evaluator 独立逐点评分并输出 JSON |
+| `src/bin/recover.rs`（新） | 独立恢复进程，唯一输入 `public/`，不读 oracle |
+| `scripts/run_m2b.sh`（新） | 三次 `cargo run --release` 编排三个独立 OS 进程 |
+| `pairing.rs` | 单测改用 `generate_for_tests`；`verify_all` 逻辑未变 |
+
+### 实测：三进程正式运行（`bash scripts/run_m2b.sh`，退出码 0）
+
+```
+[gen]     N=32 seq_len=63；trapdoor = getrandom OS entropy，未持久化 / 未提交
+          M2-A 在随机 SRS 上复跑：tau=1520 alpha=528 beta=32 total=2080 (4160 pairings)
+          public_dataset_sha256 = 18bf4eb9900119f555482d37797b2af2d49238460e2cb2c2b8fe6910436522f5
+[recover] inputs = public/aux.bin + 7 SCP1；oracle_accessed=false；trapdoor_accessed=false
+          control（小标量有界搜索功能测试）：hidden=7 → found=7，searched=1..=64
+[eval]    dataset_sha256 重算一致 = true
+          storage scopes: native TauG1=6048  SCP1 baseline=6312  aux=12480  full CRS=18528
+```
+
+| 方案 | saved | SCP1 (B) | ①/② 节省 | missing | GT 目标 | 覆盖 | P0 | 新恢复 | 已确定 | success | ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 全部幂次（基线） | 63 | 6,312 | -4.365% | 0 | 0/0 | 100.0% | 0 | 0 | 63 | 是 | 2.80 |
+| 仅奇数次幂 | 31 | 3,112 | 48.545% | 32 | 32/32 | 100.0% | 1 | 1 | 32 | **否** | 320.18 |
+| 仅偶数次幂 | 32 | 3,212 | 46.892% | 31 | 31/31 | 100.0% | 0 | 0 | 32 | **否** | 320.19 |
+| 前半部分 | 16 | 1,612 | 73.347% | 47 | 31/47 | 66.0% | 0 | 0 | 16 | **否** | 281.75 |
+| 每隔 2 | 32 | 3,212 | 46.892% | 31 | 31/31 | 100.0% | 0 | 0 | 32 | **否** | 321.32 |
+| 每隔 4 | 16 | 1,612 | 73.347% | 47 | 47/47 | 100.0% | 0 | 0 | 16 | **否** | 286.12 |
+| 每隔 8 | 8 | 812 | 86.574% | 55 | 55/55 | 100.0% | 0 | 0 | 8 | **否** | 235.93 |
+
+- **R2 生效点**：`odd_only` 的 GT 目标覆盖由 31/32 修正为 **32/32**，
+  $P_0$ 作为公开生成元被直接确定（新恢复 = 1），其余 31 个偶数次幂仍无法恢复。
+  `first_half` 仍为 31/47（$k\ge N$ 缺少公开 $Q_k$，符合预期）。
+- **R3 主指标**：`tau_g1_representation_saving_pct = 1 - SCP1/6048`；
+  `odd_only` = `1 - 3112/6048 = 48.545%`（对应评审给出的 ≈48.55%）。
+  旧 SCP1 基线口径（50.697%）保留为 `scp1_baseline_reduction_pct`；
+  另输出 `full_crs_bytes` / `full_crs_reduction_pct`（对 18,528 B）。
+  基线出现负值是正常的：SCP1 每点多 4 B 索引，比原生 Section 更大。
+  **全部百分比只是表示节省，不是有效 CRS 压缩率。**
+- 失败环节不变：$G_T\to G_1$ 求逆。结论边界不变，且不再受「种子公开」质疑。
+
+### 秘密隔离证据（本机实测）
+
+- 全仓库 `grep -rn "SRS_SEED" crates/ docs/ scripts/` 已无源码引用（文档旧节保留历史叙述）。
+- `TEST_SEED` 仅出现在 `powers.rs:118/125`，位于 `#[cfg(test)]`，release 二进制不编译。
+- `manifest.json` 字段：`phase, curve, arkworks, n, seq_len, secret_model,
+  public_dataset_sha256, aux_file, oracle_file, files, relations` —— 不含 $\tau,\alpha,\beta$ 或种子。
+- `recovered/summary.json` 显式记录 `oracle_accessed: false` / `trapdoor_accessed: false`。
+- `git check-ignore -v`：`results/raw/m2b/public/*.bin`、`oracle/tau_g1_full.bin`、
+  `results/raw/m2_results.json` 均由 `/results/raw/*` 命中，未入库。
+- M2-A 计数（1520 / 528 / 32）只依赖 $N$ 与索引范围，随机 SRS 上复跑数值不变。
+
+### 测试与提交前检查
+
+- `cargo fmt --all -- --check` ✅、`git diff --check` ✅。
+- `cargo test --workspace`：**35 个测试全绿**（ptau-audit 12 + 合成容器异常 7 +
+  srs-relations lib 16），比修订前多 7 个（R1 OS 熵、R2 生成元/隐式 P0、
+  R3 口径、SHA-256 标准向量、文件协议往返等）。
+- 过程中发现并修复 `sha256.rs` 的 `K[16]` 抄写错误（`0xefbe4788` → `0xefbe4786`），
+  已与 `ptau-audit::report` 的 K 数组逐行 diff 确认一致；标准向量全部通过。
+- Windows incremental 编译偶发 `error deleting lock file ... os error 5` 警告，
+  不影响退出码（M1 已记录）。
+- 旧版 `results/raw/compression/*.bin` 留在本地（不入库），新版产物在
+  `results/raw/m2b/`；两者不互相覆盖。
+
+### 冻结声明
+
+按用户验收：**M1（CRS 结构审计）与 M2-A（代数关系）正式冻结**，本轮未改动其结论；
+M2-B 以本修订版为准。下一阶段为 **M3：Powers of Tau 真实内存开销分析**，本轮未启动。
+
+### M3 前置待办（环境，沿用 M0 记录）
+
+- 用户已指出 snarkjs 0.7.6 `powersoftau_verify.js:341` 有
+  `MAX_CHUNK_SIZE = 1<<16`，而 `powersoftau_preparephase2.js` 的
+  `buff = new BigBuffer(nPoints * sGin)` 在 $N=2^{21}$ 时仅 Tau G1 输入缓冲即
+  $2N\times96 = 402{,}653{,}184$ B = 384 MiB。本机源码行号已核实前者的分块常量。
+- 当前 WSL2 Ubuntu 内仍无 `rustc`/`cargo`/`node` 且无外网；M3 若继续用 Windows
+  原生工具链，必须报告 **Windows Peak Working Set**，不能标成 Linux Maximum RSS。
+  进入 M3 前须先固定测量环境与口径。

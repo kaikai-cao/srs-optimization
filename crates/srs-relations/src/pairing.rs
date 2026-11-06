@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn small_n_all_relations_hold() {
-        let (_, srs) = powers::generate(4);
+        let (_, srs) = powers::generate_for_tests(4);
         let c = verify_all(&srs);
         assert_eq!(c.tau, 22);
         assert_eq!(c.alpha, 10);
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn adjacent_tau_relation_holds() {
-        let (_, srs) = powers::generate(4);
+        let (_, srs) = powers::generate_for_tests(4);
         for i in 0..(2 * srs.n - 2) {
             assert_eq!(
                 pairing_g1_g2(srs.tau_g1[i], srs.tau_g2[1]),
