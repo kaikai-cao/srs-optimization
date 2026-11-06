@@ -6,7 +6,7 @@ use std::path::Path;
 const MAGIC: &[u8; 4] = b"ptau";
 const MAX_SECTIONS: u32 = 64;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Section {
     pub index: u32,
     pub id: u32,
@@ -15,7 +15,7 @@ pub struct Section {
     pub payload_len: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PtauContainer {
     pub version: u32,
     pub declared_sections: u32,

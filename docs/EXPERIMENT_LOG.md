@@ -208,4 +208,76 @@ $$S_{\mathrm{file}} = S_{\mathrm{points}} + 160 = 589{,}920 + 160 = \boxed{590{,
   **96 B 是容器结构头，64 B 是 Section 1/7 的非群元素 payload**。
 - 这进一步说明「1.2 GB」必须注明是「有效群元素」「Section payload 总和」还是「容器文件大小」。
 
-M1-A 验收状态：**PASS（待用户逐项确认）**。本版本尚未 `git commit`，便于验收后再冻结。
+M1-A 验收状态：**PASS（用户已确认冻结）**。已单独提交并推送：`0fafedf feat(ptau-audit): scan ptau container sections`。
+
+---
+
+## M1-B ～ M1-E — 完整 CRS 结构审计（2026-11-06）
+
+新增 `header.rs` / `sections.rs` / `contributions.rs` / `report.rs`，重写 `main.rs`。
+`ptau-audit` 仍为**零 Cargo 依赖**（SHA-256 与 JSON 均为标准库手写实现）。
+完整结构说明见 `docs/CRS_STRUCTURE.md`，机器可读结果见 `results/raw/audit-*.json`（不入库）。
+
+### 实现要点
+
+- Section 1：同时校验 `n8=48` 与 48 B 小端模数（反转后比对 BLS12-381 q）；
+  `power` / `ceremony_power` 分开保留；`N=2^power` 用 `checked_shl`，`576N+96` 做溢出检查；
+  校验 Header 恰好读完 60 B。
+- Section 2–6：由 N 推导 `2N-1, N, N, N, 1` 与 `576N+96`，**逐 Section 比对实际长度**，
+  不只是打印理论值；检查 ID 重复 / 必需 Section 缺失；额外 ID（Phase 2 的 12–15）记录但不报错。
+- Section 7：4 B 计数器 + 每条 2,112 B 固定部分 + TLV 参数区。
+  实测 TLV 规则（源码 `:186-206`）：类型必须严格递增；Type 2 是 1 B 值而非长度字段；
+  参数区必须恰好消耗；记录必须恰好消耗整个 Section 7。
+- `report.rs`：纯标准库 SHA-256，1 MiB 分块；文件哈希、每个 Section payload 哈希、
+  JSON 报告、T1–T4 异常测试（复制后修改，原件不动）。
+  SHA-256 用 3 个标准向量 + 系统 `sha256sum` 交叉验证通过。
+
+### 实测（6 份文件全部 `FULL AUDIT PASS`）
+
+| 文件 | Power / N | 文件大小 (B) | 贡献数 | Section 7 (B) | 群元素数 | 群元素字节 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pot10_0000` | 10 / 1,024 | 590,080 | 0 | 4 | 5,120 | 589,920 |
+| `pot10_0001` | 10 / 1,024 | 592,215 | 1 | 2,139 | 5,120 | 589,920 |
+| `pot12_0000` | 12 / 4,096 | 2,359,552 | 0 | 4 | 20,480 | 2,359,392 |
+| `pot12_0001` | 12 / 4,096 | 2,361,683 | 1 | 2,135 | 20,480 | 2,359,392 |
+| `pot14_0000` | 14 / 16,384 | 9,437,440 | 0 | 4 | 81,920 | 9,437,280 |
+| `pot14_0001` | 14 / 16,384 | 9,439,571 | 1 | 2,135 | 81,920 | 9,437,280 |
+
+`pot10_0001` 的 Contribution #1：`Type: 0`、`Name: SRS Optimization Test`、
+`TLV types: [1]`、`Record Bytes: 2,135`、`Section 7: 2,139` — 与预期完全一致。
+Power 12/14 的名称为 17 B，故单条记录 2,131 B、Section 7 = 2,135 B（动态解析生效）。
+
+### SHA-256（六份文件，均由程序计算并与 `sha256sum` 一致）
+
+```
+9096c1886d3d094777d572a991c4523991ce3491bd6affc503a045e61a3902dc  pot10_0000.ptau
+86b13f3cb014f02e2157b5c659baa29e943d4d75f7f2018c70db7b26b9345f5c  pot10_0001.ptau
+0280084087d88e6b1b61250431eab40ef641d68619f36f74d6d90108540b0403  pot12_0000.ptau
+eda9439b2a96c1204bad169584669304488b7102faf51065e81478bd28248deb  pot12_0001.ptau
+07c098825f787f7c45e503034ba2cc5bc22a3a870a17a9690dcac08288800135  pot14_0000.ptau
+5c801f245a2c89e93638db54f9ee4a0c13930f4f964ec24c6f10e3f1bed7db63  pot14_0001.ptau
+```
+
+### snarkjs 验证（新增四份）
+
+- `powersoftau new bls12-381 12/14` + `contribute --name="SRS Power 12/14 Test" -e="srs-power12/14-test"` 均成功。
+- `npx snarkjs powersoftau verify pot12_0001.ptau -v` → `Powers of Tau Ok!`，退出码 0。
+- `npx snarkjs powersoftau verify pot14_0001.ptau -v` → `Powers of Tau Ok!`，退出码 0。
+- 均给出「不含 phase2 预计算值」警告（预期，本轮不执行 `prepare phase2`）。
+- 固定 `-e` 不可复现同一文件（M0 已记录），以 SHA-256 为输入基准。
+
+### 异常测试（4/4 拒绝）
+
+| 测试 | 修改 | 拒绝原因 |
+| --- | --- | --- |
+| T1 | magic → `xtau` | `Invalid magic` |
+| T2 | 截断最后 1 B | `Section 7 exceeds file boundary` |
+| T3 | Section 2 长度 → `u64::MAX` | `Section offset overflow` |
+| T4 | 尾部追加 1 B | `Trailing or unparsed bytes` |
+
+### 测试与已知噪声
+
+- `cargo test --workspace`（M1 阶段）：`ptau-audit` 12 个单元测试 + 7 个合成容器异常测试全部通过，
+  另两个 crate 各 0 个测试。
+- Windows 上 incremental 编译偶发 `error deleting lock file ... 拒绝访问 (os error 5)` 警告，
+  不影响编译结果与退出码；属于文件锁噪声，不是代码问题。
