@@ -265,6 +265,12 @@ eda9439b2a96c1204bad169584669304488b7102faf51065e81478bd28248deb  pot12_0001.pta
 - `npx snarkjs powersoftau verify pot14_0001.ptau -v` → `Powers of Tau Ok!`，退出码 0。
 - 均给出「不含 phase2 预计算值」警告（预期，本轮不执行 `prepare phase2`）。
 - 固定 `-e` 不可复现同一文件（M0 已记录），以 SHA-256 为输入基准。
+- **统一复跑六份文件**：三份 `_0001`（各 1 条贡献）verify 均 `Powers of Tau Ok!`、退出码 0；
+  三份 `_0000`（0 条贡献）verify 退出码 1，snarkjs 明确报
+  `This file has no contribution! It cannot be used in production`。
+  这是 snarkjs 对「尚未有贡献的初始累加器」的预期拒绝，**不是文件损坏**；
+  实验计划本来也只对 `_0001` 执行 verify。六份 `_0000` 由我们自己的
+  `ptau-audit` 完成结构审计，未依赖 snarkjs verify。
 
 ### 异常测试（4/4 拒绝）
 
@@ -281,3 +287,54 @@ eda9439b2a96c1204bad169584669304488b7102faf51065e81478bd28248deb  pot12_0001.pta
   另两个 crate 各 0 个测试。
 - Windows 上 incremental 编译偶发 `error deleting lock file ... 拒绝访问 (os error 5)` 警告，
   不影响编译结果与退出码；属于文件锁噪声，不是代码问题。
+- M1 单独提交 `3aa2503 feat(ptau-audit): full CRS structure audit with SHA-256 and negative tests`；
+  当次 `git push` 先后遇到 SSL EOF 与代理 502，本地提交保留，稍后随最终批次重试推送。
+
+---
+
+## M2-A / M2-B — 代数关系与压缩恢复实验（2026-11-06）
+
+`srs-relations` 引入 arkworks **0.6.0**（`ark-bls12-381` / `ark-ec` / `ark-ff` / `ark-std` / `ark-serialize`），
+`cargo check -p srs-relations` 通过；`Cargo.lock` 已随之锁定。
+未改动 `srs-stream`，未执行 Power 21，未设计 M3 新算法。
+详细论证见 `docs/ALGEBRAIC_RELATIONS.md` 与 `docs/COMPRESSION_EXPERIMENTS.md`。
+
+### M2-A（`cargo run --release -p srs-relations`）
+
+固定种子 `StdRng` 生成 $N=32$ 测试 SRS，秘密标量在生成器内生成并 `drop`，
+不进入任何公开参数文件或恢复接口。遍历全部合法索引组合：
+
+```
+Tau pairing relations: PASS (1520 groups)
+Alpha pairing relations: PASS (528 groups)
+Beta pairing relations: PASS (32 groups)
+Total relation checks: 2080 (4160 pairings)
+```
+
+仅证明结构一致性，**不是**完整 Powers-of-Tau 贡献验证。
+
+### M2-B（七种参数子集）
+
+| 方案 | 保存点 | 文件 (B) | 减少 | 缺失 | GT 目标 | 候选 | 恢复 | 成功 | 耗时 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 全部幂次（基线） | 63 | 6,312 | 0.00% | 0 | 0 | 0 | 63 | 是 | 6.97 |
+| 仅奇数次幂 | 31 | 3,112 | 50.70% | 32 | 31 | 351 | 0 | 否 | 313.83 |
+| 仅偶数次幂 | 32 | 3,212 | 49.11% | 31 | 31 | 352 | 0 | 否 | 314.31 |
+| 前半部分（前 N/2） | 16 | 1,612 | 74.46% | 47 | 31 | 304 | 0 | 否 | 282.35 |
+| 每隔 2 个点 | 32 | 3,212 | 49.11% | 31 | 31 | 352 | 0 | 否 | 312.37 |
+| 每隔 4 个点 | 16 | 1,612 | 74.46% | 47 | 47 | 304 | 0 | 否 | 284.57 |
+| 每隔 8 个点 | 8 | 812 | 87.14% | 55 | 55 | 242 | 0 | 否 | 229.25 |
+
+- 阳性对照：隐藏指数 7、有界搜索 1..=64 → 成功找回标量 7，证明配对/求逆实现可用。
+- 所有非基线方案失败于同一环节：**GT → G1 求逆**。
+  配对只给出 $t_k=e(G_1,G_2)^{\tau^k}\in G_T$，唯一原像 $P_k\in G_1$ 存在，
+  但构造它需要未知指数 $\tau^k$；群律只能做已知幂次的整数线性组合。
+- 公开信息可以**验证**候选点、可以算 GT 目标（但并非全覆盖：奇数方案 31/32、
+  前半方案 31/47），**不能构造**缺失的 $G_1$ 点。
+- 结论只否定本轮实际测试的恢复方法；**不宣称证明所有代数压缩不可能**。
+- 文件大小仅针对 Tau G1 子序列（arkworks canonical 96 B/点），不是整个 CRS 的压缩率。
+
+### 产物
+
+`results/raw/m2_results.json`、`results/raw/compression/*.bin`（均被 `.gitignore` 排除，
+未提交）。`cargo test -p srs-relations` 9 个单元测试全部通过。
