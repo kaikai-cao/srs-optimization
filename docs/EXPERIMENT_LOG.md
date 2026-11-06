@@ -105,3 +105,107 @@ S_points + 64B  = 589,984
   当前未执行 `npm audit fix`，以免在未冻结依赖的情况下改变 `package-lock.json`。
 - 三个 crate 目前是 `cargo new` 空壳，`Cargo.lock` 由 `cargo generate-lockfile --offline`
   生成（零外部依赖）；引入 arkworks 0.6.0 等依赖时须重新锁定并记录版本。
+
+---
+
+## M0 修订（M1-A 实施前）：容器固定开销与 1.2 GB 口径
+
+> 本节为**修订条目**，修正上文「`S_points + 64B = 589,984`」与「容器超额 96 B」的口径。
+> 上文原始实测记录保留不删，以本节为准。以下结论已在本机安装的
+> snarkjs 0.7.6 / `@iden3/binfileutils` 源码逐条核对（非外部推断）。
+
+### 源码依据（本机 `node_modules/` 实测行号）
+
+| 结论 | 源码位置 |
+| --- | --- |
+| 通用头 = 4 B magic `ptau` + 4 B version(LE u32) + 4 B nSections(LE u32) = **12 B** | `@iden3/binfileutils/src/binfileutils.js:41-46` (`createBinFile`) |
+| 每个 Section 头 = 4 B id(LE u32) + 8 B size(LE u64) = **12 B**；读取端顺序扫描 `fd.pos += hl` | 同文件 `:23-32` (`readBinFile`)、`:51-58` (`startWriteSection`)、`:60-68` (`endWriteSection`) |
+| `createBinFile(..., "ptau", 1, 7)` → version 1、7 个 Section | `snarkjs/src/powersoftau_new.js:75`；`powersoftau_contribute.js:69` 同为 7 |
+| Section 1 payload = 4 (n8) + 48 (q, BLS12-381 `F1.n8`) + 4 (power) + 4 (ceremonyPower) = **60 B** | `snarkjs/src/powersoftau_utils.js:26-50` (`writePTauHeader`)、`:52-70` (`readPTauHeader`) |
+| Section 7 起始 **4 B** = `nContributions`（初始文件写 0） | `powersoftau_new.js:130-132`；`powersoftau_utils.js:226-241, 294-304` |
+| First Challenge Hash 在文件写完**之后**由群元素计算，**不落盘** | `powersoftau_new.js:134-136` (`calculateFirstChallengeHash`) |
+
+**固定容器开销** $= 12 + 7\times12 + 60 + 4 = 160$ B。
+无贡献记录的初始 `.ptau`：
+
+$$S_{\mathrm{file}} = S_{\mathrm{points}} + 160 = 589{,}920 + 160 = \boxed{590{,}080\ \mathrm{B}}$$
+
+与 M0 实测 `pot10_0000.ptau` 完全一致。
+
+### 单次 Contribution 记录 = 2,135 B
+
+| 内容 | 字节数 | 依据 |
+| --- | --- | --- |
+| 五个贡献群元素（3×G1 + 2×G2 = 3×96 + 2×192） | 672 | `powersoftau_utils.js:244-252, 282-290` |
+| 九个公开密钥群元素（6×G1 + 3×G2 = 6×96 + 3×192） | 1,152 | `powersoftau_utils.js:157-160`（`F1.n8*2*6 + F2.n8*2*3`） |
+| Partial Hash | 216 | `snarkjs/src/misc.js:111-113`（`new Uint8Array(216)`） |
+| Next Challenge | 64 | blake2b `dkLen = 64` |
+| Type (u32) | 4 | `powersoftau_utils.js:256` |
+| Params 长度 (u32) | 4 | `powersoftau_utils.js:275-279` |
+| Name 参数（1 B 类型 + 1 B 长度 + 21 B UTF-8） | 23 | `powersoftau_utils.js:258-264`；`SRS Optimization Test` = 21 B |
+| **合计** | **2,135** | |
+
+`592{,}215 - 590{,}080 = 2{,}135` B ✓；有贡献文件的 Section 7 payload = 4 + 2,135 = **2,139 B**。
+
+### 1.2 GB 的口径必须分开报告
+
+| 口径 | N = 2^10 = 1,024 | N = 2^21 = 2,097,152 |
+| --- | --- | --- |
+| ① 五类群元素有效数据 $S_{\mathrm{points}}=576N+96$ | 589,920 B | 1,207,959,648 B |
+| ② ① + 64 B 前序贡献哈希（**引用口径**，由群元素计算，不落盘） | 589,984 B | 1,207,959,712 B |
+| ③ 初始 `.ptau` 实际文件大小 = ① + 160 | 590,080 B | **1,207,959,808 B** |
+| ④ 含 1 次贡献的文件 = ③ + Σ(单条贡献记录) | 592,215 B | 需按实际 Section 7 记录逐条累加 |
+
+- 最初的 1,207,959,712 B 对应口径 ②，**不是错误**，但它不是 `.ptau` 容器文件大小。
+- 上文「容器超额 96 B」只是 ③−② 的差值；正确表述是「容器固定开销 160 B」，
+  其中 64 B 从未作为独立字段写入文件。
+- 后续 `CRS_STRUCTURE.md` / `audit.json` 必须分别报告 ①②③④，
+  不得合并成一个「CRS 大小」；含贡献记录的文件还要单列 Section 7 完整记录（M1-C 负责）。
+- 结论口径：群元素有效数据 / Accumulator 状态引用 / 容器实际文件大小，三者不可混用。
+
+---
+
+## M1-A — 二进制容器扫描器（2026-11-06）
+
+实现：`crates/ptau-audit/src/parser.rs` + `main.rs`，**仅 Rust 标准库、零 Cargo 依赖**，
+未安装 arkworks，未改动另外两个 crate，未生成 Power 21 数据。
+`cargo check -p ptau-audit` 通过（无 warning）；两次 `cargo run` 退出码均为 0。
+
+### 实测 Section 表（两份文件，前六个 Section 完全一致）
+
+| Index | ID | Header Offset | Payload Offset | Payload Length (`0000` / `0001`) |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 12 | 24 | 60 / 60 |
+| 2 | 2 | 84 | 96 | 196,512 / 196,512 |
+| 3 | 3 | 196,608 | 196,620 | 196,608 / 196,608 |
+| 4 | 4 | 393,228 | 393,240 | 98,304 / 98,304 |
+| 5 | 5 | 491,544 | 491,556 | 98,304 / 98,304 |
+| 6 | 6 | 589,860 | 589,872 | 192 / 192 |
+| 7 | 7 | 590,064 | 590,076 | **4 / 2,139** |
+
+| 文件 | File size | Declared sections | Version | 末尾位置 | Audit result |
+| --- | --- | --- | --- | --- | --- |
+| `pot10_0000.ptau` | 590,080 | 7 | 1 | 590,080 | `CONTAINER SCAN PASS` |
+| `pot10_0001.ptau` | 592,215 | 7 | 1 | 592,215 | `CONTAINER SCAN PASS` |
+
+与预期值逐项一致；`header_offset[i+1] = payload_offset[i] + payload_len[i]` 全链自洽，
+最后一个 Section 的结束位置等于文件总大小（无重叠、无空洞、无尾部残留）。
+
+### 独立交叉核对（Node 直接读原始字节，不复用 Rust 实现）
+
+| 文件 | Σ payload | `file_size − Σ payload` | `ends_at` |
+| --- | --- | --- | --- |
+| `pot10_0000.ptau` | 589,984 | 96 | 590,080 |
+| `pot10_0001.ptau` | 592,119 | 96 | 592,215 |
+
+**补记（对 1.2 GB 口径的进一步澄清）**：
+
+- `Σ payload = S_points + 60 + 4 = S_points + 64`。
+  也就是说，最初的 `1,207,959,712 B`（N=2^21）**恰好等于初始 `.ptau` 的 Section payload 总和**；
+  其中那 64 B 并非落盘的 First Challenge Hash，而是 Section 1 参数头 60 B + Section 7 计数器 4 B。
+- `file_size − Σ payload = 96 = 12 + 7×12`（通用文件头 + 7 个 Section 头）。
+- 故固定开销 `160 = 96 + 64`，两种拆分口径互不矛盾：
+  **96 B 是容器结构头，64 B 是 Section 1/7 的非群元素 payload**。
+- 这进一步说明「1.2 GB」必须注明是「有效群元素」「Section payload 总和」还是「容器文件大小」。
+
+M1-A 验收状态：**PASS（待用户逐项确认）**。本版本尚未 `git commit`，便于验收后再冻结。
