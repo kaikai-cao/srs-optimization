@@ -1,0 +1,26 @@
+{
+  "name": "srs-optimization",
+  "version": "1.0.0",
+  "description": "Research and engineering of compact, memory-efficient SRS representations for Groth16 and pairing-based SNARKs.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaikai-cao/srs-optimization.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kaikai-cao/srs-optimization/issues"
+  },
+  "homepage": "https://github.com/kaikai-cao/srs-optimization#readme",
+  "devDependencies": {
+    "snarkjs": "^0.7.6"
+  }
+}

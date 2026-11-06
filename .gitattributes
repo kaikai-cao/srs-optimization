@@ -1,0 +1,3 @@
+# M0: the same working tree is accessed from Windows and WSL2.
+# Force LF in the working tree so shell scripts remain executable under WSL2.
+* text=auto eol=lf

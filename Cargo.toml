@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/ptau-audit",
+    "crates/srs-relations",
+    "crates/srs-stream",
+]
+
+resolver = "2"

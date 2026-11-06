@@ -1,0 +1,16 @@
+/target
+/node_modules
+
+/data/fixtures/*
+!/data/fixtures/.gitkeep
+
+/results/raw/*
+!/results/raw/.gitkeep
+
+/results/processed/*
+!/results/processed/.gitkeep
+
+*.ptau
+*.bin
+*.zkey
+*.wtns
