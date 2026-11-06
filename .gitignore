@@ -6,9 +6,18 @@
 
 /results/raw/*
 !/results/raw/.gitkeep
+# M3 text-only measurement records are small and reproducible: keep them in git.
+!/results/raw/m3_*.json
 
 /results/processed/*
 !/results/processed/.gitkeep
+!/results/processed/m3_*.csv
+!/results/processed/m3_*.svg
+!/results/processed/m3_*.json
+!/results/processed/m3_*.md
+
+# results/processed/M2-public-dataset/ (+ .zip) stay local: they contain binary
+# parameter files and are covered by /results/processed/* above.
 
 *.ptau
 *.bin

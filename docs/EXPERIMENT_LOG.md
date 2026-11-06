@@ -450,3 +450,130 @@ M2-B 以本修订版为准。下一阶段为 **M3：Powers of Tau 真实内存�
 - 当前 WSL2 Ubuntu 内仍无 `rustc`/`cargo`/`node` 且无外网；M3 若继续用 Windows
   原生工具链，必须报告 **Windows Peak Working Set**，不能标成 Linux Maximum RSS。
   进入 M3 前须先固定测量环境与口径。
+
+---
+
+## M3｜Powers of Tau 真实内存开销基线（分支 `experiment/m3-memory-baseline`）
+
+起点 `c5d0e01`（tag `m1-m2-frozen`），**M1 / M2 代码与结论零改动**。本轮只做源码审计、
+测量脚本和基线实验，未修改 snarkjs / ffjavascript 计算逻辑，未跑 Power 20/21。
+
+### M2 公开数据集归档（用户建议，非阻塞项，已完成）
+
+`results/processed/M2-public-dataset/`（目录 + `M2-public-dataset.zip`），含
+`public/`（7 个 scheme 文件 + aux.bin + manifest/relations）、`oracle/`、`recovered/`、
+`m2_results.json`、`ARCHIVE_README.md`、`SHA256SUMS`。21 个文件 `sha256sum -c` 全 OK，
+zip 26 个条目可完整解压。**不含秘密种子**（OS 熵生成、未落盘），
+`public_dataset_sha256 = 18bf4eb9900119f555482d37797b2af2d49238460e2cb2c2b8fe6910436522f5`。
+zip SHA-256：`e030671d63a4eaebdb499b5178565499f83020bd62f4e3098b17d1baeec7a33d`。
+
+归档时发现一个 Windows 细节：`public/aux.bin` 基名 `AUX` 是 DOS 保留设备名，
+Windows PowerShell 5.1 的 `Get-Item` / `Compress-Archive` 无法打开它（Rust、Node、
+Git Bash 可以）。zip 改用系统 `tar.exe`（bsdtar）生成，细节写入 `ARCHIVE_README.md`。
+
+### M3-A 源码审计（`docs/MEMORY_SOURCE_AUDIT.md`）
+
+- 审计 snarkjs 0.7.6 / ffjavascript 0.3.1 / @iden3/binfileutils 0.0.12 / fastfile 0.0.20；
+  核对 `build/cli.cjs`、`build/main.cjs` bundle 与 ESM 源码关键语句逐条对应。
+- 实测 `Fr.s = 32`、`tm.concurrency = 28`、G1/G2 affine 96/192 B、jacobian 144/288 B。
+- **纠正一个先验判断**：`engine_fft.js` 的 `_fftExt` / `lagrangeEvaluations` 的 t0/t1 扩展
+  分支只在 `bits ≥ 33` 触发，而 Power 21 最高 `bits = power+1 = 22`；且
+  `preparephase2.js:46-94` 的 ifft/t0/t1 整段被注释。常规 `_fft` 路径才是本项目的对象。
+- **新发现（用户未提及）**：`fastfile/src/osfile.js:285-288` 的 `readToBuffer` 会把
+  `maxPagesLoaded` 永久放大到 `floor(len*1.1/pageSize)+1`；Power 21 的 384 MiB 读入会
+  额外驻留约 **422 MiB** 页缓冲（54,068 页 × 8 KiB），且 `avBuffs` 复用不归还 OS。
+  这部分内存与 FFT 无关，改 FFT 无法消除。
+- 完整分配表 A1–A13 / B1–B6 / C1–C4 / W0–W1，标注类别（JS-EXT / JS-HEAP / WASM / PAGE）、
+  是否真实复制、理论生命周期、最早可释放点；`BigBuffer.slice` 在 <1 GiB 时确实全量复制。
+- 理论量级（**未实测**）：Power 21 Prepare 仅用户态活跃数据约 3.1 GiB，且 GC 决定叠加方式。
+
+### M3-B 测量工具与环境（`results/raw/m3_environment.json`）
+
+新增 `scripts/measure_snarkjs.ps1`、`run_m3_benchmarks.ps1`、`timestamp_hook.cjs`、
+`record_m3_env.cjs`、`build_m3_summary.cjs`、`measure_worker_baseline.ps1`。
+
+- 直接启动 `node.exe ... build/cli.cjs`（不经 `npx`/cmd shim），被测进程就是 snarkjs；
+  `web-worker` 在 Node 下用 `worker_threads`，worker 内存在同一进程工作集内。
+- 指标统一为 **Windows Peak Working Set**（`Process.PeakWorkingSet64`），25 ms 轮询 +
+  退出后再读一次取最大值；stdout/stderr 逐行加 `[t=NNNms]` 前缀以便分段计时。
+  每测试一份 `results/raw/m3_*.json`（含命令、输入 SHA-256/字节、输出 SHA-256/字节、
+  耗时、峰值、退出码、日志路径）。
+- 环境：Windows 11 家庭版 Insider Preview 10.0.26220 / i7-14700（28 逻辑核）/
+  31.69 GiB RAM / D: 167.6 GiB 可用 / Node v22.22.2 / PowerShell 5.1.26100.9836 /
+  snarkjs 0.7.6 / ffjavascript 0.3.1。**未使用 WSL2**，报告中不出现 Linux Maximum RSS 口径。
+
+#### 测量实现中修正的三个真实问题（保留记录）
+
+1. **.NET 属性缓存**：首轮 9 次测量峰值全部恒为 28.77 MiB。原因是
+   `Process.PeakWorkingSet64` 会缓存，必须每次 `Refresh()` 才重新取数。修正后用
+   **独立 Process 对象**（`GetProcessById` + `Refresh`）交叉验证 Power 12 Prepare
+   得到 513.99 MiB，与主脚本 513.86 MiB 一致。首轮 9 个 JSON 已全部重跑覆盖。
+2. **安全删除钩子**：测量脚本原本先删旧输出文件，被 `safe-delete` 钩子 fail-closed 拦截。
+   改为不删除，依赖 snarkjs `createOverride` 的 `O_TRUNC`，并用「退出码 + 文件
+   LastWriteTimeUtc ≥ 进程启动」判定本次产物，避免误记陈旧文件。
+3. **PowerShell 环境变量重复键**：`run_m3_benchmarks.ps1` 的 fixture 生成原用
+   `Start-Process`，本机同时存在 `HTTPS_PROXY` 与 `https_proxy`，触发
+   `ArgumentException: 已添加项`。改用 .NET `ProcessStartInfo` 直接启动。
+
+### M3-C / M3-D 基线矩阵（Windows Peak Working Set，MiB）
+
+全部使用**有贡献的** `pot<p>_0001.ptau`；`pot<p>_0000.ptau` 只作为生成中间产物。
+Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可复现，以 SHA-256 为准）。
+
+| Power | Phase 1 Verify | Phase 2 Prepare | Prepared Verify |
+| ---: | ---: | ---: | ---: |
+| 10 | 532.07 MiB / 0.86 s | 475.00 MiB / 3.64 s | 616.92 MiB / 1.20 s |
+| 12 | 501.95 MiB / 0.96 s | 513.86 MiB / 15.15 s | 715.03 MiB / 1.78 s |
+| 14 | 654.53 MiB / 1.42 s | 651.12 MiB / 77.09 s | 1152.50 MiB / 3.69 s |
+| 16 | 1117.60 MiB / 2.93 s | 1028.65 MiB / 355.84 s | 1694.68 MiB / 12.59 s |
+
+（Power 18 数据见本节末尾补记与 `docs/MEMORY_BASELINE.md`。）
+
+- `prepare phase2` 输出：p10 1,771,431 B / p12 7,079,843 B / p14 28,313,507 B /
+  p16 113,248,161 B；三份 `_0001` 与全部 `_final` 的 `powersoftau verify` 退出码均为 0。
+- 峰值工作集受 V8 GC 影响有单次运行波动（p10 Phase 1 Verify 两次分别为 532 / 547 MiB），
+  本轮以单次测量为主，另做重复实验量化离散度（见 `m3_repeatability.csv`）。
+- 未执行 Power 20/21；磁盘余量 168 GiB、内存 31.69 GiB，但是否扩大须等 Power 18 峰值实测。
+
+### M3-C/D 补记：Power 18 完成（2026-11-06）
+
+`pot18_0001.ptau`（150,997,329 B，SHA-256 `ed5b4288…fb86a1`）与 `pot18_final.ptau`
+（452,986,785 B，SHA-256 `19546863…5f2cd`）均生成成功，`powersoftau verify` 退出码 0。
+
+| Power | Phase 1 Verify | Phase 2 Prepare | Prepared Verify |
+| ---: | ---: | ---: | ---: |
+| 18 | 1195.61 MiB / 13.44 s | 1609.94 MiB / 1589.55 s | 3660.04 MiB / 43.09 s |
+
+- 矩阵完整：Power 10/12/14/16/18 ×（Phase1 Verify / Prepare / Prepared Verify）= **15 组**，全部 exit=0。
+- 关键结论：Power 18 时 Prepare 的朴素单输入缓冲仅 48 MiB（`2N×96`），实测峰值 **1610 MiB（≈33×）**；
+  这证实 M3-A 审计表 `A3/A4/A9/A11` 的多缓冲叠加是真实峰值主因，`384 MiB` 估算（p21 口径）严重低估。
+  Prepared Verify 是三者最严重热点（p18 3.6 GiB，最后一步 2.16×/翻倍）。详见 `docs/MEMORY_BASELINE.md`。
+
+### M3-E 热点分析与 H1 判断（已完成）
+
+交付 `docs/MEMORY_BASELINE.md` + `results/processed/m3_summary.csv` + `m3_tables.md` +
+`m3_peak_vs_power.svg` + `m3_phase_timings.csv`。
+
+- 五个热点问题全部回答（分块有效性 / FFT 重复缓冲 / 全域 MSM 复制 / 超线性增长 / 时间-空间交换）。
+- **H1（consume-input FFT）方向成立但单次收益有限**：消除一次 48 MiB~384 MiB 副本只是其中一项，
+  真正放大峰值的是 `A3` 页缓存与 `A9` 并发分片 + 28 线程 WASM；建议与「缩短页缓存生命周期」「限制 FFT 并发分片」
+  合并评估。任何优化必须满足 `Optimized Output == Original Output`（Sections 12–15 逐字节核对 + 完整 `verify` 通过）。
+- Power 21 外推（未运行，仅测算）：Prepared Verify 峰值可能 15–25 GiB，在当前 32 GiB 机器有 OOM 风险；
+  磁盘（~3 GiB）充足。按用户要求未跑 p20/21。
+
+### M3 提交与 Git
+
+- 单独分支 `experiment/m3-memory-baseline`（从 `m1-m2-frozen` = `c5d0e01` 切出）。
+- 提交 `feat(m3): add powers-of-tau memory profiling baseline`，含 `docs/`（M3-A 审计 + M3-E 基线）、
+  `scripts/`（6 个测量/汇总脚本）、`results/processed/m3_*.csv|svg`（汇总，非原始大文件）、
+  `results/raw/m3_environment.json`（环境快照）。
+- **未入库**：所有 `.ptau` / `*_final.ptau` / `results/raw/m3_*.json` 原始测量（被 `.gitignore` 排除），
+  仅保留 SHA-256、大小与汇总。
+- 提交前自检：`cargo fmt --all -- --check` 通过（Rust 部分未改动）、`cargo test --workspace` 35 测试全绿、
+  三份 `_0001` 与 `_final` 的 `snarkjs verify` 退出码 0。
+
+### 本轮验证的「用户先验假设 ≠ 实测」清单（诚实记录）
+
+1. 「384 MiB 是 Phase 2 Prepare 峰值」→ 实测 p18 已达 1610 MiB，且 p18 朴素输入仅 48 MiB（≈33×），证明多缓冲叠加。
+2. 「Phase 1 Verify 的 65,536 分块控制了峰值」→ 成立但只是三者最低，仍随 Power 增至 1.2 GiB（页缓存 `A3` 累积）。
+3. 「Prepared Verify 只是多一次 MSM」→ 实测峰值增长最快（p18 3.6 GiB，超线性），是首要优化目标。
