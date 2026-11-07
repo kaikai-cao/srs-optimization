@@ -8,9 +8,14 @@
   Each iteration:
     - sets M4_FASTFILE_OUT to a per-run JSON consumed by m4_instrument.js
     - passes -ExtraRequire scripts/m4_instrument.js (FastFile page-pool probe)
-    - passes -Timeline to capture a timestamped memory series
+  measure_snarkjs.ps1 always records a per-poll memory timeline, which since M4.1
+  carries BOTH the current commit charge (Process.PagedMemorySize64) and the
+  historical peak (Process.PeakPagedMemorySize64).
   After the loop it writes a manifest JSON listing every run, then calls
   build_m4_summary.cjs to produce the aggregated CSV / markdown tables.
+
+  -Prefix controls the run-label prefix (default 'm4'). Use e.g. 'm4_1' to add a
+  calibration set without overwriting the frozen M4 runs.
 
   This is the M4 baseline step: 3-5 independent repeats of Prepared Verify at
   Power 16 / 18, recorded with Peak Working Set + Peak Pagefile + FastFile pool.
@@ -27,6 +32,9 @@ param(
     [string]$InputPath,
 
     [int]$Repeats = 3,
+
+    # Run-label prefix, e.g. 'm4' -> m4_prepared_verify_p18_r1.
+    [string]$Prefix = 'm4',
 
     [int]$PollIntervalMs = 50,
 
@@ -67,10 +75,10 @@ New-Item -ItemType Directory -Force -Path $resultsFull, $logsFull | Out-Null
 
 $runs = [System.Collections.Generic.List[object]]::new()
 
-Write-Output ("=== M4 baseline: operation=$Operation power=$Power repeats=$Repeats ===")
+Write-Output ("=== M4 baseline: operation=$Operation power=$Power repeats=$Repeats prefix=$Prefix ===")
 
 for ($i = 1; $i -le $Repeats; $i++) {
-    $label = "m4_${Operation}_p${Power}_r${i}"
+    $label = "${Prefix}_${Operation}_p${Power}_r${i}"
     $ffOut = Join-Path $resultsFull "${label}.fastfile.json"
 
     # Per-run FastFile pool output (consumed by m4_instrument.js at node exit).
@@ -111,10 +119,11 @@ $manifest = [ordered]@{
     operation  = $Operation
     power      = $Power
     repeats    = $Repeats
-    instrument = 'm4_instrument.js (FastFile page-pool probe)'
+    prefix     = $Prefix
+    instrument = 'm4_instrument.js (FastFile page-pool probe, synchronized snapshots)'
     runs       = $runs
 }
-$manifestPath = Join-Path $resultsFull "m4_manifest_${Operation}_p${Power}.json"
+$manifestPath = Join-Path $resultsFull "${Prefix}_manifest_${Operation}_p${Power}.json"
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 6) + "`n", $utf8)
 Write-Output ("manifest: " + (Join-Path $ResultsDir (Split-Path $manifestPath -Leaf)))

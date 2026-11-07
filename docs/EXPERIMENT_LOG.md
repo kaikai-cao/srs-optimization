@@ -591,10 +591,15 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
   | 18 | 3642.0 (0.81%) | 4380.0 (0.52%) | 39.8 s | 52.8 MiB（1.45% of WS） |
 
 - **与 M3 单次测量互验**：p18 3642 vs 3660（−0.5%），p16 1662 vs 1695（−1.9%）；重复测量 CV ≤ 1.74%，基线可复现。
+  → **M4.1 修正**：该 −0.5% 是同会话内的巧合。跨会话（M4.1 另测 3 次）p18 均值为 3784 MiB（+3.9%），
+  三会话合计 3617–3894 MiB（均值 3713，CV 2.7%）。「≈3.6 GiB 非噪声」成立，两位小数的精度不成立。
 - **FastFile 页面池实测（非估算）**：p16 1690 页 × 8 KiB = 13.2 MiB；p18 6759 页 × 8 KiB = 52.8 MiB。
   每次 `capacity == held` 且 `avBuffs = 0`（峰值时所有已分配页缓冲都是活映射页，不存在“仅容量”虚增）。
   池随输入 O(N) 线性增长（4× 数据 → 4× 池），但仅占峰值 0.79% / 1.45%。
   **M3 的 422 MiB 只适用于 `prepare_phase2` 的 384 MiB 单次读入，不适用于 prepared_verify**——实测已证实。
+  → **M4.1 修正**：`capacity == held` 原为三个独立历史最大值，不能断言“峰值时刻”；已改为同一采样时刻的同步快照。
+  且 422 MiB 是「384 MiB 单次读入的容量估算」，p21 下 prepared_verify 的 G2 全域读取本身即为 384 MiB。
+  p18 实测 52.8 MiB 对应的是一次 **48 MiB** 读取（`2^18 × 192 B`，G2），不是 25 MiB。
 - **分阶段拆解**：Phase 1（分块贡献验证）在 p18 仅约 0.8–1.3 GiB；Phase 2 首个全域 MSM（tauG1）
   使 WS 从 1.29 GiB 跃至 3.48 GiB（**+2.2 GiB**，t≈11.3→18.8 s），是峰值主因；
   FastFile 全程恒定 52.8 MiB，无法解释该跳变。MSM/FFT 内部各分配（H1 输入副本、分片缓冲、
@@ -610,3 +615,43 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 - 提交（仅汇总入库；raw json / timeline / log 按约定不入库）：`results/processed/m4_summary_p16|p18.csv|md`、
   `docs/MEMORY_BASELINE_M4.md`、`scripts/m4_instrument.js`、`scripts/measure_m4.ps1`、
   `scripts/build_m4_summary.cjs`、`scripts/m4_stage_analysis.cjs`。
+
+### M4.1 — 测量口径修订（不新增优化、不扩大 Power）
+
+- 分支 `experiment/m4-1-metric-calibration`。目标只有一个：把 M4 的**观测口径**改对，
+  再进入 M5 分配归因。M4 的三次峰值结果不推翻，另以 `m4_1_` 前缀补测 3 次（p16/p18 各 3 次，6 次全部 exit 0）。
+- **五处修订**：
+
+  | # | M4 表述 | M4.1 修正 |
+  | ---: | --- | --- |
+  | 1 | 时间线 `pagefile_mib` 当作「当前 commit」 | 它实为 `PeakPagedMemorySize64`（历史高水位，永不下降）。改名 `peak_commit_so_far_mib`，并新增真正的瞬时序列 `current_commit_mib`（`PagedMemorySize64`）；时间线共四个量：`ws_mib` / `current_commit_mib` / `peak_ws_mib` / `peak_commit_so_far_mib` |
+  | 2 | 「commit 比 WS 高 18–20%，故约 1/5 提交内存未驻留」 | **删除**。两个独立历史峰值可能发生在不同时刻，且两者统计对象不同；只分别报告两项峰值，不做减法/比例 |
+  | 3 | 「最大读取是单个 Lagrange 段 ~25 MiB，故池子 ~53 MiB」 | 最大读取是 **48 MiB**：`sG = G.F.n8*2` → G2 为 192 B/point，`2^18 × 192 B = 48 MiB`；`floor(48 MiB×1.1/8 KiB)+1 = 6759` 页，与实测完全吻合 |
+  | 4 | 「422 MiB 只属于 prepare_phase2」 | p21 下 prepared_verify 的 G2 全域读取即为 `2^21 × 192 B = 384 MiB`，同样给出 ≈422 MiB **容量估算**；并非 prepare_phase2 专属，且 p21 未实测，估算 ≠ 驻留 |
+  | 5 | 「每次 `capacity == held`，峰值时所有页缓冲都在活动映射」 | 三个量原为独立历史最大值。探针改为每次采样同步读取 `(maxPagesLoaded, pagesCount, avBuffs)` 三元组并保存快照；结论收紧为「容量最大那次采样中，已装载页数等于容量且无空闲缓冲」 |
+
+- **补测结果（M4.1 会话，n=3，MiB）**：
+
+  | Power | Peak WS mean ± sd (CV) | Peak Commit mean ± sd (CV) | 采样到的当前 commit 最大值 |
+  | ---: | ---: | ---: | ---: |
+  | 16 | 1656.65 ± 64.73 (3.91%) | 1956.97 ± 66.47 (3.40%) | 1932 / 2023 / 1892 |
+  | 18 | 3783.97 ± 95.32 (2.52%) | 4497.23 ± 88.81 (1.97%) | 4381 / 4581 / 4377 |
+
+  与 M4 会话合并（n=6）：p16 1659.44 ± 44.94（CV 2.71%）、commit 1963.11 ± 46.50；
+  p18 3712.98 ± 100.14（CV 2.70%）、commit 4438.64 ± 86.51。
+  **会话间漂移 +3.9%（p18 WS）/ +2.7%（commit）**，大于会话内 CV——这是本轮最有价值的方法学发现：
+  同一名义测量在不同会话可差 ~4%，此前「与 M3 差 −0.5%」属巧合。
+- **采样覆盖率的自校验**：`sampled_commit_max_mib` 只回收 `peak_commit_mib` 的 **98.4–99.8%**，
+  说明 50 ms 轮询会低估峰值 ~0–1.6%，因此峰值一律取内核计数器，时间线只用于形状。
+- **FastFile 同步快照（6 次运行全部一致）**：p16 `(cap 1690, pages 1690, av 0)` = 13.2 MiB（占均值峰值 0.80%）；
+  p18 `(cap 6759, pages 6759, av 0)` = 52.8 MiB（1.42%）。即容量上限由实际在用页撑满，不存在「仅容量」虚增。
+- **阶段表改用当前值**（p18 r1，peak 3738/4444）：Phase 1 当前 WS 峰值 1131 MiB（β·τ·G1 处，t≈11.5 s）；
+  Phase 2 tauG1 起点 776 MiB → tauG2 标记处 2936 MiB（**+2.2 GiB**），50% 分位已 3378 MiB；
+  此后在 3.0–3.4 GiB 平台振荡，峰值 3738 MiB 出现在 βτG1（t≈36 s）。FastFile 全程恒定 52.8 MiB。
+- **工具改动**：`measure_snarkjs.ps1`（四量时间线 + `peak_commit_*` 改名 + `sampled_commit_max_*`）、
+  `m4_instrument.js`（同步快照，输出 `peakCapacitySnapshot`/`peakHeldSnapshot`/`nSamples`）、
+  `measure_m4.ps1`（`-Prefix`，默认 `m4` 保持原命名）、`build_m4_summary.cjs`（`peak_commit_mib` 回退旧字段 +
+  快照列）、`m4_stage_analysis.cjs`（当前/历史 commit 双列 + 标记处取当前值）。
+- 汇总入库：`results/processed/m4_1_summary_p16|p18.csv|md`；报告 `docs/MEMORY_BASELINE_M4.md` 已按上表重写 §0–§6。
+- **下一批（M5）不做 patch，只做归因**：对 `engine_multiexp.js` / `engine_fft.js` 记录分配大小与释放时机，
+  回答那 +2.2 GiB 中 FFT 输入副本、MSM 分片/累加缓冲、WASM 线性内存各占多少；再决定先动哪一处（H1 / MSM 并发 / 缓冲生命周期）。

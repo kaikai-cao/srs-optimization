@@ -10,6 +10,10 @@
     - wall-clock elapsed time
     - Windows Peak Working Set via Process.PeakWorkingSet64, polled at 25 ms
       while the process runs and read once more after exit (max sample wins)
+    - Windows Peak Commit Charge via Process.PeakPagedMemorySize64 (historical
+      peak, authoritative) alongside the per-poll CURRENT commit charge
+      Process.PagedMemorySize64 (so the timeline shows a real instantaneous
+      series, not a monotonically non-decreasing high-water mark)
     - exit code, timeout flag
     - stdout / stderr logs, each line prefixed with [t=NNNms]
 
@@ -161,6 +165,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 [long]$peak = 0
 [long]$wsMax = 0
 [long]$pageMax = 0
+[long]$commitMax = 0
 [int]$samples = 0
 [bool]$timedOut = $false
 $memorySeries = [System.Collections.Generic.List[object]]::new()
@@ -170,17 +175,22 @@ do {
         # Process.PeakWorkingSet64 / WorkingSet64 are CACHED in .NET.
         # Without Refresh() every sample returns the same first-read value.
         $proc.Refresh()
+        # Historical (monotonic) peaks -- authoritative regardless of poll rate.
         $v = $proc.PeakWorkingSet64
-        $w = $proc.WorkingSet64
         $p = $proc.PeakPagedMemorySize64
+        # Current values -- these can go DOWN, so they describe the shape only.
+        $w = $proc.WorkingSet64
+        $c = $proc.PagedMemorySize64
         if ($v -gt $peak) { $peak = $v }
         if ($w -gt $wsMax) { $wsMax = $w }
         if ($p -gt $pageMax) { $pageMax = $p }
+        if ($c -gt $commitMax) { $commitMax = $c }
         $memorySeries.Add([ordered]@{
-            t_ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 0)
-            peak_ws_mib = [math]::Round($v / 1MB, 3)
-            ws_mib = [math]::Round($w / 1MB, 3)
-            pagefile_mib = [math]::Round($p / 1MB, 3)
+            t_ms                   = [math]::Round($sw.Elapsed.TotalMilliseconds, 0)
+            ws_mib                 = [math]::Round($w / 1MB, 3)
+            current_commit_mib     = [math]::Round($c / 1MB, 3)
+            peak_ws_mib            = [math]::Round($v / 1MB, 3)
+            peak_commit_so_far_mib = [math]::Round($p / 1MB, 3)
         })
         $samples++
     } catch { }
@@ -228,7 +238,7 @@ $result = [ordered]@{
     snarkjs_version            = $snarkjsVersion
     ffjavascript_version       = $ffjsVersion
     node_version               = $nodeVersion
-    metric                     = 'Windows Peak Working Set (Process.PeakWorkingSet64)'
+    metric                     = 'Windows memory: Peak Working Set (Process.PeakWorkingSet64) + Peak Commit Charge (Process.PeakPagedMemorySize64)'
     command_line               = $commandLine
     cli_args                   = $cliArgs
     node_exe                   = $NodeExe
@@ -245,8 +255,10 @@ $result = [ordered]@{
     peak_working_set_mib       = [math]::Round($peak / 1MB, 3)
     current_ws_max_bytes       = $wsMax
     current_ws_max_mib         = [math]::Round($wsMax / 1MB, 3)
-    peak_pagefile_usage_bytes  = $pageMax
-    peak_pagefile_usage_mib    = [math]::Round($pageMax / 1MB, 3)
+    peak_commit_bytes          = $pageMax
+    peak_commit_mib            = [math]::Round($pageMax / 1MB, 3)
+    sampled_commit_max_bytes   = $commitMax
+    sampled_commit_max_mib     = [math]::Round($commitMax / 1MB, 3)
     peak_samples               = $samples
     poll_interval_ms           = $PollIntervalMs
     exit_code                  = $exitCode
@@ -266,7 +278,7 @@ $tl = [ordered]@{
     run_id     = $Label
     operation  = $Operation
     power      = $Power
-    metric     = 'Windows Peak Working Set timeline (per poll)'
+    metric     = 'Per-poll memory timeline: current WS, current commit charge, and both historical peaks'
     poll_ms    = $PollIntervalMs
     samples    = $memorySeries.Count
     series     = $memorySeries
@@ -274,8 +286,8 @@ $tl = [ordered]@{
 [System.IO.File]::WriteAllText($timelinePath, ($tl | ConvertTo-Json -Depth 4) + "`n", $utf8)
 
 $status = if ($exitCode -eq 0) { 'PASS' } else { 'FAIL' }
-Write-Output ("{0,-34} power={1,-2} exit={2,-3} {3,-4} elapsed={4,9:N0} ms  peak={5,9:N1} MiB  json={6}" -f `
-    $Label, $Power, $exitCode, $status, $result.elapsed_ms, $result.peak_working_set_mib, (Get-Rel $jsonPath))
+Write-Output ("{0,-34} power={1,-2} exit={2,-3} {3,-4} elapsed={4,9:N0} ms  peak={5,9:N1} MiB  commit={6,9:N1} MiB  json={7}" -f `
+    $Label, $Power, $exitCode, $status, $result.elapsed_ms, $result.peak_working_set_mib, $result.peak_commit_mib, (Get-Rel $jsonPath))
 
 if ($exitCode -ne 0) {
     Write-Output ("  stderr tail: " + (($stderrTask.Result -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '))

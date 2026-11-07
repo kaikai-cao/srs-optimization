@@ -2,12 +2,17 @@
  * build_m4_summary.cjs <manifest.json> [--out <m4_summary.csv>]
  *
  * Reads the M4 repeat manifest produced by measure_m4.ps1. For each run it reads
- * the per-run measure_snarkjs JSON (peak working set, peak pagefile, elapsed,
+ * the per-run measure_snarkjs JSON (peak working set, peak commit charge, elapsed,
  * exit code, input hash) and the per-run FastFile pool JSON (m4_instrument.js
  * output). It aggregates the repeats (mean / median / min / max / stdev / CV over
  * PASS runs) and emits:
  *   - <out>.csv   (one row per measured quantity, stats columns)
  *   - <out>.md    (markdown tables: stats + per-run detail + FastFile per-file)
+ *
+ * Field names: peak commit charge is `peak_commit_mib` (PeakPagedMemorySize64).
+ * Pre-M4.1 JSONs used `peak_pagefile_usage_mib` for the same quantity; that name
+ * was misleading (it is a commit-charge peak, not "pagefile usage"), so it is
+ * accepted only as a fallback.
  */
 'use strict';
 
@@ -57,7 +62,8 @@ function main() {
       exitCode: run.exit_code,
       pass: run.exit_code === 0,
       peakWs: run.peak_working_set_mib,
-      peakPf: run.peak_pagefile_usage_mib,
+      peakPf: typeof run.peak_commit_mib === 'number' ? run.peak_commit_mib : run.peak_pagefile_usage_mib,
+      sampledCommitMax: run.sampled_commit_max_mib,
       elapsed: run.elapsed_ms,
       inputHash: run.input_sha256,
       ffGlobal: ff.global || null,
@@ -69,6 +75,8 @@ function main() {
         peakPagesCount: f.peakPagesCount,
         peakAvBuffsCount: f.peakAvBuffsCount,
         heldMiB: f.heldMiB,
+        nSamples: f.nSamples,
+        capSnap: f.peakCapacitySnapshot || null,
       })),
     };
   });
@@ -91,6 +99,7 @@ function main() {
 
   const sWs = statsOf('peakWs');
   const sPf = statsOf('peakPf');
+  const sSc = statsOf('sampledCommitMax');
   const sEl = statsOf('elapsed');
   // FastFile global peaks: take the *max* observed across PASS runs (upper bound of cache footprint).
   const ffCap = pass.map((r) => (r.ffGlobal ? r.ffGlobal.peakCapacityMiB : 0)).filter((v) => v > 0);
@@ -102,8 +111,9 @@ function main() {
   const rows = [
     ['quantity', 'power', 'operation', 'n_runs', 'n_pass', 'mean', 'median', 'min', 'max', 'stdev', 'cv_pct'],
     ['peak_working_set_mib', manifest.power, manifest.operation, nRuns, nPass, sWs.mean, sWs.median, sWs.min, sWs.max, sWs.stdev, sWs.cv],
-    ['peak_pagefile_usage_mib', manifest.power, manifest.operation, nRuns, nPass, sPf.mean, sPf.median, sPf.min, sPf.max, sPf.stdev, sPf.cv],
+    ['peak_commit_mib', manifest.power, manifest.operation, nRuns, nPass, sPf.mean, sPf.median, sPf.min, sPf.max, sPf.stdev, sPf.cv],
     ['elapsed_ms', manifest.power, manifest.operation, nRuns, nPass, sEl.mean, sEl.median, sEl.min, sEl.max, sEl.stdev, sEl.cv],
+    ['sampled_commit_max_mib', manifest.power, manifest.operation, nRuns, nPass, sSc.mean, sSc.median, sSc.min, sSc.max, sSc.stdev, sSc.cv],
     ['ff_peak_capacity_mib', manifest.power, manifest.operation, nRuns, nPass, ffCapStats.mean, ffCapStats.max, ffCapStats.max, ffCapStats.max, 0, 0],
     ['ff_peak_held_mib', manifest.power, manifest.operation, nRuns, nPass, ffHeldStats.mean, ffHeldStats.max, ffHeldStats.max, ffHeldStats.max, 0, 0],
   ];
@@ -122,14 +132,17 @@ function main() {
   md.push('| Quantity | n | mean | median | min | max | stdev | CV % |');
   md.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
   md.push(`| Peak Working Set (MiB) | ${sWs.n} | ${sWs.mean} | ${sWs.median} | ${sWs.min} | ${sWs.max} | ${sWs.stdev} | ${sWs.cv} |`);
-  md.push(`| Peak Pagefile Usage (MiB) | ${sPf.n} | ${sPf.mean} | ${sPf.median} | ${sPf.min} | ${sPf.max} | ${sPf.stdev} | ${sPf.cv} |`);
+  md.push(`| Peak Commit Charge — \`PeakPagedMemorySize64\` (MiB) | ${sPf.n} | ${sPf.mean} | ${sPf.median} | ${sPf.min} | ${sPf.max} | ${sPf.stdev} | ${sPf.cv} |`);
+  if (sSc.n) {
+    md.push(`| Max sampled current commit — \`PagedMemorySize64\` (MiB) | ${sSc.n} | ${sSc.mean} | ${sSc.median} | ${sSc.min} | ${sSc.max} | ${sSc.stdev} | ${sSc.cv} |`);
+  }
   md.push(`| Elapsed (ms) | ${sEl.n} | ${sEl.mean} | ${sEl.median} | ${sEl.min} | ${sEl.max} | ${sEl.stdev} | ${sEl.cv} |`);
   md.push(`| FastFile peak cache capacity (MiB) | ${nPass} | ${ffCapStats.mean} | ${ffCapStats.max} | ${ffCapStats.max} | ${ffCapStats.max} | 0 | 0 |`);
   md.push(`| FastFile peak held buffers (MiB) | ${nPass} | ${ffHeldStats.mean} | ${ffHeldStats.max} | ${ffHeldStats.max} | ${ffHeldStats.max} | 0 | 0 |`);
   md.push('');
   md.push('## Per-run detail');
   md.push('');
-  md.push('| run | label | exit | peak WS (MiB) | peak Pagefile (MiB) | elapsed (ms) | FF cap (MiB) | FF held (MiB) |');
+  md.push('| run | label | exit | peak WS (MiB) | peak commit (MiB) | elapsed (ms) | FF cap (MiB) | FF held (MiB) |');
   md.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |');
   runs.forEach((r) => {
     const cap = r.ffGlobal ? r.ffGlobal.peakCapacityMiB : '-';
@@ -139,31 +152,46 @@ function main() {
   md.push('');
   md.push('## FastFile per-file page pool (max across PASS runs)');
   md.push('');
-  md.push('| file | pageSize | peakMaxPagesLoaded | capacity (MiB) | peakPages | peakAvBuffs | held (MiB) |');
-  md.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  md.push('`cap@p` = capacity (pages) and `pages@cap`/`av@cap` = the page and free-buffer counts');
+  md.push('read in the SAME sample as that capacity. Independent maxima are listed separately.');
+  md.push('');
+  md.push('| file | pageSize | peakMaxPagesLoaded | capacity (MiB) | peakPages | peakAvBuffs | held (MiB) | cap@p | pages@cap | av@cap |');
+  md.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
   // union of files across pass runs, taking max per fileName
   const fileMap = new Map();
   pass.forEach((r) => r.ffFiles.forEach((f) => {
-    const cur = fileMap.get(f.fileName) || { capacityMiB: 0, peakPagesCount: 0, peakAvBuffsCount: 0, peakMaxPagesLoaded: 0, pageSize: f.pageSize, heldMiB: 0 };
+    const cur = fileMap.get(f.fileName) || {
+      capacityMiB: 0, peakPagesCount: 0, peakAvBuffsCount: 0, peakMaxPagesLoaded: 0,
+      pageSize: f.pageSize, heldMiB: 0, capSnap: null,
+    };
     cur.capacityMiB = Math.max(cur.capacityMiB, f.capacityMiB);
     cur.heldMiB = Math.max(cur.heldMiB, f.heldMiB);
     cur.peakPagesCount = Math.max(cur.peakPagesCount, f.peakPagesCount);
     cur.peakAvBuffsCount = Math.max(cur.peakAvBuffsCount, f.peakAvBuffsCount);
     cur.peakMaxPagesLoaded = Math.max(cur.peakMaxPagesLoaded, f.peakMaxPagesLoaded);
     cur.pageSize = f.pageSize;
+    if (f.capSnap && (!cur.capSnap || f.capSnap.capacityBytes > cur.capSnap.capacityBytes)) {
+      cur.capSnap = f.capSnap;
+    }
     fileMap.set(f.fileName, cur);
   }));
   if (fileMap.size === 0) {
-    md.push('| (no FastFile pool data captured) | | | | | | |');
+    md.push('| (no FastFile pool data captured) | | | | | | | | | |');
   } else {
     for (const [name, f] of fileMap) {
-      md.push(`| ${name} | ${f.pageSize} | ${f.peakMaxPagesLoaded} | ${f.capacityMiB} | ${f.peakPagesCount} | ${f.peakAvBuffsCount} | ${f.heldMiB} |`);
+      const s = f.capSnap;
+      const capP = s ? s.maxPagesLoaded : '-';
+      const pagesAtCap = s ? s.pagesCount : '-';
+      const avAtCap = s ? s.avBuffsCount : '-';
+      md.push(`| ${name} | ${f.pageSize} | ${f.peakMaxPagesLoaded} | ${f.capacityMiB} | ${f.peakPagesCount} | ${f.peakAvBuffsCount} | ${f.heldMiB} | ${capP} | ${pagesAtCap} | ${avAtCap} |`);
     }
   }
   md.push('');
   md.push('> `capacityMiB = peakMaxPagesLoaded * pageSize` is the page-buffer cache UPPER BOUND that fastfile');
   md.push('> keeps allocated (never returned to OS) while the file descriptor is open. `heldMiB` is the');
   md.push('> sum of actually-allocated page buffers (`peakPagesCount + peakAvBuffsCount`) * pageSize.');
+  md.push('> The three `peak*` columns are INDEPENDENT historical maxima and may come from different');
+  md.push('> instants; the `*@cap` columns are one synchronized sample, so only those may be compared.');
   md.push('');
 
   const mdPath = args.out.replace(/\.csv$/i, '.md');

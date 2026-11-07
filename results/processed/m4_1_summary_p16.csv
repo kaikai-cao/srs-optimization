@@ -1,0 +1,7 @@
+quantity,power,operation,n_runs,n_pass,mean,median,min,max,stdev,cv_pct
+peak_working_set_mib,16,prepared_verify,3,3,1656.648,1631.168,1608.535,1730.242,64.731,3.91
+peak_commit_mib,16,prepared_verify,3,3,1956.97,1935.398,1903.961,2031.551,66.474,3.4
+elapsed_ms,16,prepared_verify,3,3,10759.163,10279.909,10235.341,11762.24,868.976,8.08
+sampled_commit_max_mib,16,prepared_verify,3,3,1948.875,1931.957,1891.73,2022.938,67.22,3.45
+ff_peak_capacity_mib,16,prepared_verify,3,3,13.2,13.2,13.2,13.2,0,0
+ff_peak_held_mib,16,prepared_verify,3,3,13.2,13.2,13.2,13.2,0,0
