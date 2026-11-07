@@ -27,9 +27,11 @@
    首位，是基于"未归因"的合理猜测，本次审计把它降级。**（`prepare_phase2` 是另一条曲线，FFT 在那里才是
    主路径，见 §4.3。）
 5. **FastFile 仍是 ≤ 1.5%**（52.8 MiB），维持 M4.1 结论，M5 只作为对照行。
-6. **模型对 p18 tauG1 段 +2.2 GiB 的误差约 2%**：扣除 phase-1 已支付的 223 MiB Worker WASM 存量后，
-   模型段增量 = 在途 970 +（1455 − 223）= **2200 MiB**，对照实测 +2160 MiB。**绝对峰**上仍有 0.5–0.8 GiB
-   残差（lagrange 段叠加 + GC 滞后），**这才是 M5-B/C/D 探针要分离的部分，不作为结论。**
+6. **模型对 p18 tauG1 段 +2.2 GiB 的解释度约 98%**：扣除 phase-1 已支付的 223 MiB Worker WASM 存量后，
+   模型段增量 = 在途 970 +（1455 − 223）= **2200 MiB**，对照实测 +2160 MiB（1.02×）。但**偏差是单向偏高的**：
+   p16 段增量高估 2.3×，两个 power 的绝对峰分别高出实测 502 / 818 MiB。**所以 970 与 1455 是上界，不是实测值**；
+   探针要做的正是把它们逐项落实（`task_send.inflight` 时间序列、28 个 Worker 的 `wasm_bytes` 末态）。
+   p18 的 2% 吻合不能当作"模型已验证"——它是两项误差相加抵消的结果。
 
 ---
 
@@ -283,6 +285,8 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2
 - 开关：`M5_TRACE=1` 才激活；`M5_OUT=<path>.jsonl` 指定输出；两者都缺省时走与原版**相同的代码路径、
   相同的返回值形状**（所有探针分支都在 `if (!M5_ON) return;` 之后，不新增 await、不改任务顺序）。
 - 输出物：`results/raw/m5_<op>_p<power>_r<n>.jsonl`（**不提交**，与 M3/M4 raw 同策略）。
+- Worker 内的开关同样读 `process.env.M5_TRACE`：`worker_threads` 默认继承父进程环境变量，不必额外传参；
+  但 `M5_OUT` 在 Worker 里**无效**（Worker 无 `fs`），只由主线程消费。
 
 ### 6.2 遥测通道（避免打断原有 Promise 协议）
 
@@ -292,7 +296,7 @@ Worker 现有协议是 `self.postMessage(ctx.out)`，主线程 `getOnMsg` 直接
 设计：payload 改成一个**只在开启时**出现的包装对象，解包只发生在 `getOnMsg` 一处：
 
 ```js
-// threadman.js, getOnMsg(i)
+// threadman.js:145-158, getOnMsg(i)（现有四行 + 我们的三行）
 let payload = data;
 if (payload && payload.__m5) {          // 仅 M5_TRACE=1 时存在
     tm.m5.ingest(payload.__m5, i);      // 主线程落盘（worker 内无 fs）
@@ -300,9 +304,10 @@ if (payload && payload.__m5) {          // 仅 M5_TRACE=1 时存在
 }
 tm.working[i] = false;
 tm.pendingDeferreds[i].resolve(payload);
+tm.processWorks();
 ```
 
-Worker 侧：
+Worker 侧（`threadman_thread.js:17-25` 走的正是 `self.postMessage(runTask(data))`）：
 
 ```js
 // threadman_thread.js, runTask() 末尾
