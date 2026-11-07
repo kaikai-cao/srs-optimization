@@ -655,3 +655,31 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 - 汇总入库：`results/processed/m4_1_summary_p16|p18.csv|md`；报告 `docs/MEMORY_BASELINE_M4.md` 已按上表重写 §0–§6。
 - **下一批（M5）不做 patch，只做归因**：对 `engine_multiexp.js` / `engine_fft.js` 记录分配大小与释放时机，
   回答那 +2.2 GiB 中 FFT 输入副本、MSM 分片/累加缓冲、WASM 线性内存各占多少；再决定先动哪一处（H1 / MSM 并发 / 缓冲生命周期）。
+
+---
+
+## M5-A｜探针设计与源码分配路径审计（2026-11-07，无实验）
+
+- **分支**：`experiment/m5-attribution`。本轮**不跑任何新测量、不改依赖、不改计算逻辑**；
+  交付 `docs/M5_PROBE_DESIGN.md` + `scripts/m5_budget.cjs`（纯静态算术）。
+- **源码级事实（ffjavascript 0.3.1，逐行核对）**：
+  1. `threadman_thread.js:44-56` 的 `alloc()` 扩容判据在 `u32[0]` 已 `+= length` 后再加一次 `length`，
+     等价于要求 `byteLength >= top + 2*length` → **单 Worker 线性内存 ≈ 2× 首块 ALLOCSET**；任务结束只回滚
+     分配指针（`:115-117`），**永不缩容**。
+  2. `engine_multiexp.js:119-125`：`nBitChunks = floor(255/bitChunk)+1`，`chunkSize = floor(N / (concurrency / nBitChunks))`；
+     每个 bit-chunk 任务**各带整块** bases+scalars，`queueAction` **不传 transfer list** → 结构化克隆。
+     克隆总量 = `nBitChunks × N × 128 B`，**与并发度无关**；在途量 ≈ `min(28, 任务数) × 单任务载荷`。
+  3. 全路径唯一的 transfer 是启动时每个 Worker 的 wasm 模块字节（`threadman.js:137`）。
+  4. Worker 源码经 `thread.toString()` → data URL → `VM.runInThisContext`，**无模块级 `require`**，
+     遥测只能随结果 `postMessage` 回传，由主线程落盘；且不能额外 `postMessage`（会被 `getOnMsg` 误判为任务完成）。
+- **账本（模型值，p18 prepared_verify）**：tauG1 MSM `2^19` 点 → 18 bit-chunk × 2 point-chunk = 36 任务，
+  单任务 41.2/22.9 MiB，在途峰 **970 MiB**，28 个 Worker 的 WASM 容量合计 **1455 MiB**；lagrange MSM 505/759；
+  Fr FFT 16/44；FastFile 52.8。扣除 phase-1 已支付的 223 MiB 后，tauG1 段增量模型 **2200 MiB**，
+  对照 M4.1 实测 **+2160 MiB**（误差 2%）。
+- **推翻/降级 M4 的候选排序**：原 H1（FFT 输入副本 `buff.slice`）在 prepared_verify@p18 约 50 MiB（≈2%），降级；
+  `prepare_phase2` 相反——那里 FFT 是主路径，但模型账本（430 MiB）远小于 M3 实测（1610 MiB），
+  残差指向「重复分配未及时回收」，故 M5 必须测 `arrayBuffers` 而不只是 WASM。
+- **未做**：不改 `chunkSize`/`concurrency`/任务顺序；不引入 transfer list；不「顺手修」`alloc()` 的双倍余量；
+  不跑 p20/p21。
+- **下一步**：M5-B 按 `docs/M5_PROBE_DESIGN.md` §6 实现 instrumentation-only patch（vendor 副本 + resolve hook + JSONL），
+  再由 M5-C p10 smoke 验证扰动预算，M5-D 做 p16/p18 交错对照。
