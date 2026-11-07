@@ -578,3 +578,35 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 1. 「384 MiB 是 Phase 2 Prepare 峰值」→ 实测 p18 已达 1610 MiB，且 p18 朴素输入仅 48 MiB（≈33×），证明多缓冲叠加。
 2. 「Phase 1 Verify 的 65,536 分块控制了峰值」→ 成立但只是三者最低，仍随 Power 增至 1.2 GiB（页缓存 `A3` 累积）。
 3. 「Prepared Verify 只是多一次 MSM」→ 实测峰值最高（p18 3.6 GiB，但单次测量+固定基线无法判定超线性，详见基线报告 Q4），是首要优先研究目标。
+
+### M4 — Prepared Verify 重复基线 + FastFile 页面池实测 + 分阶段拆解
+
+- 分支 `experiment/m4-repeat-baseline`（从 `main`/`2736c2b` 切出）。对 `powersoftau verify`
+  （Prepared Verify）在 p16 / p18 各运行 **3 次**，6 次全部 exit 0。
+- 基线（Windows Peak Working Set / Peak Commit，MiB）：
+
+  | Power | Peak WS mean (CV) | Peak Commit mean (CV) | Elapsed mean | FastFile 页面池 |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 16 | 1662.2 (1.74%) | 1969.3 (1.50%) | 10.0 s | 13.2 MiB（0.79% of WS） |
+  | 18 | 3642.0 (0.81%) | 4380.0 (0.52%) | 39.8 s | 52.8 MiB（1.45% of WS） |
+
+- **与 M3 单次测量互验**：p18 3642 vs 3660（−0.5%），p16 1662 vs 1695（−1.9%）；重复测量 CV ≤ 1.74%，基线可复现。
+- **FastFile 页面池实测（非估算）**：p16 1690 页 × 8 KiB = 13.2 MiB；p18 6759 页 × 8 KiB = 52.8 MiB。
+  每次 `capacity == held` 且 `avBuffs = 0`（峰值时所有已分配页缓冲都是活映射页，不存在“仅容量”虚增）。
+  池随输入 O(N) 线性增长（4× 数据 → 4× 池），但仅占峰值 0.79% / 1.45%。
+  **M3 的 422 MiB 只适用于 `prepare_phase2` 的 384 MiB 单次读入，不适用于 prepared_verify**——实测已证实。
+- **分阶段拆解**：Phase 1（分块贡献验证）在 p18 仅约 0.8–1.3 GiB；Phase 2 首个全域 MSM（tauG1）
+  使 WS 从 1.29 GiB 跃至 3.48 GiB（**+2.2 GiB**，t≈11.3→18.8 s），是峰值主因；
+  FastFile 全程恒定 52.8 MiB，无法解释该跳变。MSM/FFT 内部各分配（H1 输入副本、分片缓冲、
+  WASM 线性内存）的精确切分留待 M5 对 `engine_multiexp.js`/`engine_fft.js` 仪器化，M4 不作归因。
+- **工具修正**（本轮踩坑，诚实记录）：
+  1. `Process.PeakPagefileUsage` 在 .NET Framework 4.x **不存在**，M3 读到的 `0` 是静默 `$null`；
+     改用 `Process.PeakPagedMemorySize64` 记录峰值提交量（commit charge）。
+  2. `$Timeline` 参数与 `$timeline` 局部变量因 PowerShell **大小写不敏感**而冲突，把 List 赋给 bool
+     类型变量被强制转换为 `$true`，导致 `.Add()` 每次抛异常、`peak_samples=0`；已移除该参数并把局部
+     变量改名 `$memorySeries`。
+  3. 探针每次读只做 O(1) 读 `maxPagesLoaded`，O(pages) 的 `Object.keys` 仅由 50 ms 采样器执行，
+     避免把 p16 耗时从 ~10 s 抬到 ~18 s（内存峰值不受影响）。
+- 提交（仅汇总入库；raw json / timeline / log 按约定不入库）：`results/processed/m4_summary_p16|p18.csv|md`、
+  `docs/MEMORY_BASELINE_M4.md`、`scripts/m4_instrument.js`、`scripts/measure_m4.ps1`、
+  `scripts/build_m4_summary.cjs`、`scripts/m4_stage_analysis.cjs`。

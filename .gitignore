@@ -16,6 +16,10 @@
 !/results/processed/m3_*.json
 !/results/processed/m3_*.md
 
+# M4 committed artifacts: repeat-baseline summaries only (raw timelines stay local).
+!/results/processed/m4_*.csv
+!/results/processed/m4_*.md
+
 # results/processed/M2-public-dataset/ (+ .zip) stay local: they contain binary
 # parameter files and are covered by /results/processed/* above.
 

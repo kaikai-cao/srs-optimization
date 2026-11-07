@@ -1,0 +1,6 @@
+quantity,power,operation,n_runs,n_pass,mean,median,min,max,stdev,cv_pct
+peak_working_set_mib,16,prepared_verify,3,3,1662.241,1662.684,1633.102,1690.938,28.921,1.74
+peak_pagefile_usage_mib,16,prepared_verify,3,3,1969.255,1968.121,1940.297,1999.348,29.542,1.5
+elapsed_ms,16,prepared_verify,3,3,10022.058,9866.417,9844.903,10354.855,288.411,2.88
+ff_peak_capacity_mib,16,prepared_verify,3,3,13.2,13.2,13.2,13.2,0,0
+ff_peak_held_mib,16,prepared_verify,3,3,13.2,13.2,13.2,13.2,0,0

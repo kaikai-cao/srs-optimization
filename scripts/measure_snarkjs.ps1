@@ -23,7 +23,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('phase1_verify', 'prepare_phase2', 'prepared_verify')]
     [string]$Operation,
 
     [Parameter(Mandatory = $true)]
@@ -44,10 +43,19 @@ param(
 
     [int]$TimeoutSec = 0,
 
-    [string]$NodeExe = ''
+    [string]$NodeExe = '',
+
+    # Optional second --require hook (e.g. M4 FastFile instrumentation).
+    # A per-poll memory timeline (<Label>.timeline.json) is always recorded.
+    [string]$ExtraRequire = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+$validOps = @('phase1_verify', 'prepare_phase2', 'prepared_verify')
+if ($validOps -notcontains $Operation) {
+    throw "Operation must be one of: $($validOps -join ', ')"
+}
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $script:Hook = Join-Path $repoRoot 'scripts\timestamp_hook.cjs'
@@ -104,7 +112,11 @@ switch ($Operation) {
     }
 }
 
-$nodeArgs = @('--require', $Hook, $Cli) + $cliArgs
+$nodeArgs = @('--require', $Hook)
+if ($ExtraRequire) {
+    $nodeArgs += @('--require', $ExtraRequire)
+}
+$nodeArgs += @($Cli) + $cliArgs
 $argLine = ($nodeArgs | ForEach-Object { Quote-Arg $_ }) -join ' '
 $commandLine = "$(Quote-Arg $NodeExe) $argLine"
 
@@ -116,6 +128,7 @@ New-Item -ItemType Directory -Force -Path $resultsFull, $logsFull | Out-Null
 $stdoutLog = Join-Path $logsFull "$Label.stdout.log"
 $stderrLog = Join-Path $logsFull "$Label.stderr.log"
 $jsonPath = Join-Path $resultsFull "$Label.json"
+$timelinePath = Join-Path $resultsFull "$Label.timeline.json"
 
 # ---- Fixed dependency versions (read from installed packages) --------------
 $snarkjsVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'node_modules\snarkjs\package.json') -Raw | ConvertFrom-Json).version
@@ -150,6 +163,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 [long]$pageMax = 0
 [int]$samples = 0
 [bool]$timedOut = $false
+$memorySeries = [System.Collections.Generic.List[object]]::new()
 
 do {
     try {
@@ -158,10 +172,16 @@ do {
         $proc.Refresh()
         $v = $proc.PeakWorkingSet64
         $w = $proc.WorkingSet64
-        $p = $proc.PeakPagefileUsage
+        $p = $proc.PeakPagedMemorySize64
         if ($v -gt $peak) { $peak = $v }
         if ($w -gt $wsMax) { $wsMax = $w }
         if ($p -gt $pageMax) { $pageMax = $p }
+        $memorySeries.Add([ordered]@{
+            t_ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 0)
+            peak_ws_mib = [math]::Round($v / 1MB, 3)
+            ws_mib = [math]::Round($w / 1MB, 3)
+            pagefile_mib = [math]::Round($p / 1MB, 3)
+        })
         $samples++
     } catch { }
     if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
@@ -176,7 +196,7 @@ try {
     $proc.Refresh()
     $v = $proc.PeakWorkingSet64
     if ($v -gt $peak) { $peak = $v }
-    $p = $proc.PeakPagefileUsage
+    $p = $proc.PeakPagedMemorySize64
     if ($p -gt $pageMax) { $pageMax = $p }
 } catch { }
 $proc.WaitForExit()
@@ -235,10 +255,23 @@ $result = [ordered]@{
     stderr_log                 = Get-Rel $stderrLog
     stdout_lines               = ($stdoutTask.Result -split "`n").Count
     stderr_lines               = ($stderrTask.Result -split "`n").Count
+    timeline_enabled           = $true
+    timeline_path              = Get-Rel $timelinePath
     timestamp_utc              = (Get-Date).ToUniversalTime().ToString('o')
 }
 
 [System.IO.File]::WriteAllText($jsonPath, ($result | ConvertTo-Json -Depth 8) + "`n", $utf8)
+
+$tl = [ordered]@{
+    run_id     = $Label
+    operation  = $Operation
+    power      = $Power
+    metric     = 'Windows Peak Working Set timeline (per poll)'
+    poll_ms    = $PollIntervalMs
+    samples    = $memorySeries.Count
+    series     = $memorySeries
+}
+[System.IO.File]::WriteAllText($timelinePath, ($tl | ConvertTo-Json -Depth 4) + "`n", $utf8)
 
 $status = if ($exitCode -eq 0) { 'PASS' } else { 'FAIL' }
 Write-Output ("{0,-34} power={1,-2} exit={2,-3} {3,-4} elapsed={4,9:N0} ms  peak={5,9:N1} MiB  json={6}" -f `
