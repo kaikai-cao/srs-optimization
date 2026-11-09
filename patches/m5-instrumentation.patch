@@ -1,5 +1,5 @@
 diff --git "a/C:\\Users\\dell\\AppData\\Local\\Temp\\ffjs-orig-main.cjs" "b/D:\\Research\\srs-optimization\\vendor\\ffjavascript-0.3.1-m5\\build\\main.cjs"
-index 5bb247b..6184bca 100644
+index 5bb247b..5646f39 100644
 --- "a/C:\\Users\\dell\\AppData\\Local\\Temp\\ffjs-orig-main.cjs"
 +++ "b/D:\\Research\\srs-optimization\\vendor\\ffjavascript-0.3.1-m5\\build\\main.cjs"
 @@ -1,5 +1,6 @@
@@ -67,7 +67,7 @@ index 5bb247b..6184bca 100644
                  self.postMessage(res);
              }
          };
-@@ -4294,10 +4314,15 @@ function thread(self) {
+@@ -4294,11 +4314,30 @@ function thread(self) {
          while (u32[0] & 3) u32[0]++;  // Return always aligned pointers
          const res = u32[0];
          u32[0] += length;
@@ -77,13 +77,29 @@ index 5bb247b..6184bca 100644
              const currentPages = memory.buffer.byteLength / 0x10000;
              let requiredPages = Math.floor((u32[0] + length) / 0x10000)+1;
              if (requiredPages>MAXMEM) requiredPages=MAXMEM;
-+            if (M5_CUR) M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
-+                from_pages: currentPages, to_pages: requiredPages, top: u32[0],
-+                t_hr: M5_HR ? M5_HR() : null});
-             memory.grow(requiredPages-currentPages);
+-            memory.grow(requiredPages-currentPages);
++            if (M5_CUR) {
++                // M5-E.2: record the grow on BOTH sides of memory.grow() so the
++                // analyser can treat [t_hr_before, t_hr_after] as the capacity
++                // change window. t_hr keeps the pre-call value for backward
++                // compatibility with any reader that predates this split.
++                // m5top is captured BEFORE memory.grow() detaches the current
++                // linear-memory view (u32); reading u32[0] after grow yields
++                // undefined, which broke the L2 grow.top replay (grow_ts FAIL).
++                const m5hrB = M5_HR ? M5_HR() : null;
++                const m5top = u32[0];
++                memory.grow(requiredPages-currentPages);
++                M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
++                    from_pages: currentPages, to_pages: requiredPages, top: m5top,
++                    t_hr_before: m5hrB, t_hr: m5hrB,
++                    t_hr_after: M5_HR ? M5_HR() : null});
++            } else {
++                memory.grow(requiredPages-currentPages);
++            }
          }
          return res;
-@@ -4319,7 +4344,7 @@ function thread(self) {
+     }
+@@ -4319,7 +4358,7 @@ function thread(self) {
          u8.set(new Uint8Array(buffer), pointer);
      }
  
@@ -92,7 +108,7 @@ index 5bb247b..6184bca 100644
          if (task[0].cmd == "INIT") {
              return init(task[0]);
          }
-@@ -4329,15 +4354,21 @@ function thread(self) {
+@@ -4329,15 +4368,21 @@ function thread(self) {
          };
          const u32a = new Uint32Array(memory.buffer, 0, 1);
          const oldAlloc = u32a[0];
@@ -114,7 +130,7 @@ index 5bb247b..6184bca 100644
                  setBuffer(ctx.vars[task[i].var], task[i].buff);
                  break;
              case "CALL": {
-@@ -4354,6 +4385,7 @@ function thread(self) {
+@@ -4354,6 +4399,7 @@ function thread(self) {
                  break;
              }
              case "GET":
@@ -122,7 +138,7 @@ index 5bb247b..6184bca 100644
                  ctx.out[task[i].out] = getBuffer(ctx.vars[task[i].var], task[i].len).slice();
                  break;
              default:
-@@ -4361,8 +4393,26 @@ function thread(self) {
+@@ -4361,8 +4407,26 @@ function thread(self) {
              }
          }
          const u32b = new Uint32Array(memory.buffer, 0, 1);
@@ -151,7 +167,7 @@ index 5bb247b..6184bca 100644
      }
  
  
-@@ -4517,6 +4567,11 @@ async function buildThreadManager(wasm, singleThread) {
+@@ -4517,6 +4581,11 @@ async function buildThreadManager(wasm, singleThread) {
                  data = e;
              }
  
@@ -163,7 +179,7 @@ index 5bb247b..6184bca 100644
              tm.working[i]=false;
              tm.pendingDeferreds[i].resolve(data);
              tm.processWorks();
-@@ -4542,14 +4597,22 @@ class ThreadManager {
+@@ -4542,14 +4611,22 @@ class ThreadManager {
          this.oldPFree = 0;
      }
  
@@ -188,7 +204,7 @@ index 5bb247b..6184bca 100644
  
          return this.pendingDeferreds[workerId].promise;
      }
-@@ -4558,22 +4621,26 @@ class ThreadManager {
+@@ -4558,22 +4635,26 @@ class ThreadManager {
          for (let i=0; (i<this.workers.length)&&(this.actionQueue.length > 0); i++) {
              if (this.working[i] == false) {
                  const work = this.actionQueue.shift();
@@ -218,7 +234,7 @@ index 5bb247b..6184bca 100644
              });
              this.processWorks();
          }
-@@ -4873,7 +4940,7 @@ const pTSizes = [
+@@ -4873,7 +4954,7 @@ const pTSizes = [
  function buildMultiexp(curve, groupName) {
      const G = curve[groupName];
      const tm = G.tm;
@@ -227,7 +243,7 @@ index 5bb247b..6184bca 100644
          if ( ! (buffBases instanceof Uint8Array) ) {
              if (logger) logger.error(`${logText} _multiExpChunk buffBases is not Uint8Array`);
              throw new Error(`${logText} _multiExpChunk buffBases is not Uint8Array`);
-@@ -4934,7 +5001,7 @@ function buildMultiexp(curve, groupName) {
+@@ -4934,7 +5015,7 @@ function buildMultiexp(curve, groupName) {
                  {cmd: "GET", out: 0, var: 2, len: G.F.n8*3}
              ];
              opPromises.push(
@@ -236,7 +252,7 @@ index 5bb247b..6184bca 100644
              );
          }
  
-@@ -4987,13 +5054,18 @@ function buildMultiexp(curve, groupName) {
+@@ -4987,13 +5068,18 @@ function buildMultiexp(curve, groupName) {
          if (chunkSize>MAX_CHUNK_SIZE) chunkSize = MAX_CHUNK_SIZE;
          if (chunkSize<MIN_CHUNK_SIZE) chunkSize = MIN_CHUNK_SIZE;
  
@@ -256,7 +272,7 @@ index 5bb247b..6184bca 100644
                  if (logger) logger.debug(`Multiexp end: ${logText}: ${i}/${nPoints}`);
                  return r;
              }));
-@@ -5131,6 +5203,9 @@ function buildFFT(curve, groupName) {
+@@ -5131,6 +5217,9 @@ function buildFFT(curve, groupName) {
  
          const l2Chunk = log2(pointsInChunk);
  
@@ -266,7 +282,7 @@ index 5bb247b..6184bca 100644
          const promises = [];
          for (let i = 0; i< nChunks; i++) {
              if (logger) logger.debug(`${loggerTxt}: fft ${bits} mix start: ${i}/${nChunks}`);
-@@ -5161,7 +5236,7 @@ function buildFFT(curve, groupName) {
+@@ -5161,7 +5250,7 @@ function buildFFT(curve, groupName) {
              } else {
                  task.push({cmd: "GET", out:0, var: 0, len: sMid*pointsInChunk});
              }
@@ -275,7 +291,7 @@ index 5bb247b..6184bca 100644
                  if (logger) logger.debug(`${loggerTxt}: fft ${bits} mix end: ${i}/${nChunks}`);
                  return r;
              }));
-@@ -5218,7 +5293,7 @@ function buildFFT(curve, groupName) {
+@@ -5218,7 +5307,7 @@ function buildFFT(curve, groupName) {
                          task.push({cmd: "GET", out: 0, var: 0, len: pointsInChunk*sMid});
                          task.push({cmd: "GET", out: 1, var: 1, len: pointsInChunk*sMid});
                      }
@@ -284,21 +300,33 @@ index 5bb247b..6184bca 100644
                          if (logger) logger.debug(`${loggerTxt}: fft ${bits} join  ${i}/${bits}  ${j+1}/${nGroups} ${k}/${nChunksPerGroup/2}`);
                          return r;
                      }));
-@@ -5259,6 +5334,13 @@ function buildFFT(curve, groupName) {
+@@ -5237,6 +5326,9 @@ function buildFFT(curve, groupName) {
+             }
+         }
+ 
++        let m5ChunkBytes = 0;
++        for (let i=0; i<nChunks; i++) m5ChunkBytes += (chunks[i] ? chunks[i].byteLength : 0);
++        const m5AsmT0hr = (typeof process !== "undefined" && process.hrtime && process.hrtime.bigint) ? String(process.hrtime.bigint()) : null;
+         if (buff instanceof BigBuffer) {
+             buffOut = new BigBuffer(nPoints*sOut);
+         } else {
+@@ -5259,6 +5351,15 @@ function buildFFT(curve, groupName) {
              }
          }
  
 +        if (M5 && M5.on) {
-+            let chunksBytes = 0;
-+            for (let i=0; i<nChunks; i++) chunksBytes += (chunks[i] ? chunks[i].byteLength : 0);
-+            M5.emit({ev: 'fft_assembly', call_id: m5c ? m5c.call_id : null, site: loggerTxt || 'fft',
-+                n_points: nPoints, s_in: sIn, s_mid: sMid, s_out: sOut,
-+                copy_bytes: nPoints * sIn, chunks_bytes: chunksBytes, out_bytes: buffOut.byteLength});
-+        }
++        // M5-E.2: chunks_bytes is counted BEFORE the delete loop (see the
++        // counting block inserted just above the BigBuffer branch), so it
++        // reflects the real transient working set of the assembly, not 0.
++        M5.emit({ev: 'fft_assembly', call_id: m5c ? m5c.call_id : null, site: loggerTxt || 'fft',
++            n_points: nPoints, s_in: sIn, s_mid: sMid, s_out: sOut,
++            copy_bytes: nPoints * sIn, chunks_bytes: m5ChunkBytes, out_bytes: buffOut.byteLength,
++            t_hr_start: m5AsmT0hr, t_hr_end: (typeof process !== "undefined" && process.hrtime && process.hrtime.bigint) ? String(process.hrtime.bigint()) : null});
++    }
          if (returnArray) {
              return buffer2array(buffOut, sOut);
          } else {
-@@ -5381,6 +5463,8 @@ function buildFFT(curve, groupName) {
+@@ -5381,6 +5482,8 @@ function buildFFT(curve, groupName) {
          if (chunkSize > MAX_CHUNK_SIZE) chunkSize = MAX_CHUNK_SIZE;
  
          const opPromises = [];
@@ -307,7 +335,7 @@ index 5bb247b..6184bca 100644
  
          for (let i=0; i<nPoints; i += chunkSize) {
              if (logger) logger.debug(`${loggerTxt}: fftJoinExt Start: ${i}/${nPoints}`);
-@@ -5417,7 +5501,7 @@ function buildFFT(curve, groupName) {
+@@ -5417,7 +5520,7 @@ function buildFFT(curve, groupName) {
              task.push({cmd: "GET", out: 0, var: 0, len: n*sOut});
              task.push({cmd: "GET", out: 1, var: 1, len: n*sOut});
              opPromises.push(

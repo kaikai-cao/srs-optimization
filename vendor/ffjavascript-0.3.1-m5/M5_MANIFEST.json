@@ -1,12 +1,12 @@
 {
   "experiment": "M5-B",
-  "generated_utc": "2026-11-09T08:41:24.315Z",
+  "generated_utc": "2026-11-09T09:50:32.552Z",
   "source": "node_modules/ffjavascript@0.3.1",
   "dest": "vendor/ffjavascript-0.3.1-m5",
   "target_file": "build/main.cjs",
   "why_bundle": "package.json exports[\".\"].node.require -> ./build/main.cjs; thread.toString() is taken from this bundle",
   "sha256_before": "40128293f4c64cc614f65fd6e670a955c4af7787a15d95b49ec058a02625dd01",
-  "sha256_after": "0302310960b09c13eb831daa953b8bec46f59adaf868c733939ea994e638ba6d",
+  "sha256_after": "67126970eea1333f95340274ce837decdd4af4da4830de021022630cb68cdece",
   "sha256_runtime": "b418cda64c4e752eca54ce1284a3fa71a29f265e50add24f441549f56ea79cf0",
   "patches_applied": [
     "P1 runtime require",
@@ -31,8 +31,9 @@
     "P20 _fft mix: enqueue with ctx",
     "P21 _fft join: enqueue with ctx",
     "P22 _fft: assembly event",
+    "P24 _fftJoinExt: count chunk bytes + stamp assembly start BEFORE delete",
     "P23 _fftJoinExt: plan event + ctx (lagrangeEvaluations / fftExt path)",
     "P24 _fftJoinExt: enqueue with ctx"
   ],
-  "patch_count": 24
+  "patch_count": 25
 }

@@ -158,6 +158,14 @@ $proc = New-Object System.Diagnostics.Process
 $proc.StartInfo = $psi
 [void]$proc.Start()
 
+# M5-E.2: wall-clock epoch at process start. The Node probe records
+# anchor.t0_epoch_ms (Date.now()) when its runtime loads. The .NET Stopwatch
+# below starts a few microseconds later and is the origin of series[].t_ms. The
+# analyser reconciles the two clocks via these two epoch stamps:
+#   ws_abs_epoch = start_epoch_ms + series[].t_ms
+#   node_abs_epoch = anchor.t0_epoch_ms + (hrtime - t0_hr)/1e6
+$startEpochMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+
 $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
 $stderrTask = $proc.StandardError.ReadToEndAsync()
 
@@ -233,6 +241,7 @@ $result = [ordered]@{
     run_id                     = $Label
     operation                  = $Operation
     power                      = $Power
+    start_epoch_ms              = $startEpochMs
     curve                      = 'BLS12-381'
     platform                   = 'windows-native'
     snarkjs_version            = $snarkjsVersion
@@ -278,6 +287,7 @@ $tl = [ordered]@{
     run_id     = $Label
     operation  = $Operation
     power      = $Power
+    start_epoch_ms = $startEpochMs
     metric     = 'Per-poll memory timeline: current WS, current commit charge, and both historical peaks'
     poll_ms    = $PollIntervalMs
     samples    = $memorySeries.Count

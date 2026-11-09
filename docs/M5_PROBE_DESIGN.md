@@ -600,7 +600,7 @@ for (let i = 0; i < nPoints; i += chunkSize) {
 | `batch_plan` | `batchConvert` 入口 | `call_id, site, n_points, s_in, s_out, n_chunks` |
 | `fft_plan` | `_fft` 入口 | `call_id, site, n_points, bits, points_in_chunk, n_chunks, inverse` |
 | `fftjoinext_plan` | `_fftJoinExt` 入口 | `call_id, site, n_points, s_in, s_mid, s_out, chunk_size, fn` |
-| `fft_assembly` | `_fft` 末尾 | `call_id, site, copy_bytes, chunks_bytes, out_bytes` |
+| `fft_assembly` | `_fft` 末尾 | `call_id, site, copy_bytes, chunks_bytes, out_bytes, t_hr_start, t_hr_end` |
 | `task_send` | `postAction`（入队时） | `task_id, call_id, worker, site, kind, t_send_ms, clone_buffer_bytes, wasm_alloc_bytes, worker_output_bytes, cmd_count` |
 | `worker_task` | worker `runTask` 末尾 | `task_id, call_id, worker, alloc_base, wasm_before, wasm_after, alloc_top, allocs[], grow_events[], allocset_bytes, set_bytes, get_bytes, out_bytes, cmd_count, t_hr_start, t_hr_end, w_heap_used, w_external, w_array_buffers` |
 | `task_done` | `getOnMsg` | `task_id, call_id, worker, svc_ms` |
@@ -611,8 +611,10 @@ for (let i = 0; i < nPoints; i += chunkSize) {
 
 - `allocs[]`：按命令顺序列出本任务每个 `ALLOC` / `ALLOCSET` 的字节数。MSM 是 `[bases, scalars, jac]`，
   batchconvert 是 `[n·sIn, n·sOut]`，FFT mix 是 `[sMid·pts]`，FFT join 是 `[pts·sMid, pts·sMid, 32, 32]`。长度 ≤ 6。
-- `grow_events[]`：`[{at_alloc, len, from_pages, to_pages, top, t_hr}]`，在 `alloc()` 内部记录。
-  `t_hr` 是 M5-E.1 加的：它是**真实的**扩容时刻，而不是"主线程收到任务回复"的时刻（两者相差可达 700 MiB 的容量）。
+- `grow_events[]`：`[{at_alloc, len, from_pages, to_pages, top, t_hr_before, t_hr_after}]`，在 `alloc()` 内部、
+  紧挨 `memory.grow` 记录（保留 `t_hr = t_hr_before` 向后兼容）。`t_hr_before` / `t_hr_after` 是 M5-E.2 加的：
+  它们取在 `memory.grow` 的**前一刻与后一刻**，是**真实的**扩容时刻，而不是"主线程收到任务回复"的时刻
+  （两者相差可达 700 MiB 的容量）。L2 核对二者都落在 `t_hr_start..t_hr_end` 任务窗口内且逐 Worker 单调。
 - `alloc_base` 与 `wasm_before` 加上 `allocs[]`，即可从底座起逐条重放，**页数必须逐一相等**（§7.6 L2）。
 
 字段口径（五条，全部踩过）：
@@ -625,14 +627,18 @@ for (let i = 0; i < nPoints; i += chunkSize) {
    `wasm_alloc_bytes` 必须等于 `sum(allocs)`——两者由独立代码路径产生，L2 用它做交叉校验。
 4. `alloc_base` 用来**推翻或确认 HYP-1**：实测 102,328 B，且每个 Worker 的每个任务都相同（L2 断言）。
 5. 时间戳：主线程用 `process.hrtime.bigint() - t0hr`；Worker 用**同一个** `process.hrtime.bigint()`
-   （跨线程同源），相对原点由 `anchor.t0_hr` 给出。这是 `grow_events[].t_hr` 能与 WS 采样对齐的前提。
+   （跨线程同源），相对原点由 `anchor.t0_hr` 给出。但 `process.hrtime` 与 Windows 采样器的 `.NET Stopwatch`
+   **没有共同原点**，所以 M5-E.2 额外在采样时间线写 `start_epoch_ms`、在探针 `anchor` 写 `t0_epoch_ms`，
+   两端都换算到**绝对 epoch 毫秒**后，`grow_events[].t_hr_before/t_hr_after` 才能与 WS 采样同轴对齐
+   （见 §10.14，归因产物打印 `ws_alignment=epoch-aligned`）。
 
 ### 7.5 采样纪律
 
 - 事件按任务/计划粒度触发，**不在分配循环里打点**；禁止 `Uint8Array.prototype.slice` 全局劫持、
   每秒级 `Object.keys` 扫描、在 `alloc()` 内写日志（M4 教训：O(pages) 探针让 p16 从 10 s 变 18 s）。
-- 唯一的例外是 `alloc()` 里的 `hrtime.bigint()`：它只在**真要扩容的分支**里取一次（p18 全程 180 次），
-  不做字符串拼接、不写盘，事件对象由 `runTask` 结束时统一上报。这一条是 M5-E.1 为拿到真实 grow 时刻而加的。
+- 唯一的例外是 `alloc()` 里的 `hrtime.bigint()`：它只在**真要扩容的分支**里、紧挨 `memory.grow`
+  取 `t_hr_before`（前）与 `t_hr_after`（后）各一次（p18 全程 180 次），不做字符串拼接、不写盘，
+  事件对象由 `runTask` 结束时统一上报。这一条由 M5-E.1 起为拿到真实 grow 时刻而加，M5-E.2 进一步取了 grow 前后两次。
 - 主线程缓存数组，每 256 条或 250 ms 落盘；`process.on('exit')` 兜底 flush。
 
 ### 7.6 验收门槛（三层，替代原 70%–100% 区间）
@@ -727,9 +733,13 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
     batch 路径虚高 **3.0×**、FFT 虚高 **2.2×**。`wasm_alloc_bytes == sum(allocs)` 已进 L2 作为硬门
     （20,145 / 16,582 全部相等），因为这两者由完全独立的代码路径产生。
 14. **`memory.grow` 的时间戳必须记在 `alloc()` 里，不能记在任务完成时**：M5-E 把 grow 记在
-    `worker_task` 到达主线程的时刻，于是"在途峰时容量只有 778.3 MiB"——比真实值低 **706 MiB**，
-    并由此得出"两者不同时在场"的错误结论。真实值是在途峰那一刻 `C = 1,484.4 MiB`（p18，终值的 93.9%）。
-    **凡是"某时刻的容量"都必须用 `grow_events[].t_hr`，不能用任务完成顺序推。**
+   `worker_task` 到达主线程的时刻，于是"在途峰时容量只有 778.3 MiB"——比真实值低 **706 MiB**，
+   并由此得出"两者不同时在场"的错误结论。M5-E.1 用 `grow_events[].t_hr` 修正后，在途峰那一刻
+   `C = 1,465.5 / 400.9 MiB`（p18 / p16，终值的 **92.7% / 94%**）——两者**高度重叠**，但各自极大值
+   **不在同一瞬间**（在途峰比最后一处 grow 早 5.4 s / 2.1 s）。M5-E.2 进一步在 `alloc()` 内取
+   `t_hr_before` / `t_hr_after`，并把 Worker `process.hrtime` 与 Windows `.NET Stopwatch` 经
+   `t0_epoch_ms` / `start_epoch_ms` 对齐到绝对 epoch 毫秒（归因产物打印 `ws_alignment=epoch-aligned`）。
+   **凡是"某时刻的容量"都必须用 `grow_events[].t_hr_before/t_hr_after`，不能用任务完成顺序推。**
 15. **"结束"不等于"最后一个采样点"**：snarkjs 在 `prepared_verify` 返回后销毁 ThreadManager，
     采样器还会继续轮询 200–300 ms，期间 WS 从 2,714 掉到 207 MiB。任何"运行结束时"的量都必须
     以**最后一个任务完成**为界，不能用 `series` 的末元素。
@@ -780,7 +790,7 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 
 | 组件 | 文件 | 状态 |
 | --- | --- | --- |
-| vendor 副本 + 24 处断言式补丁 | `scripts/m5_build_vendor.cjs` → `vendor/ffjavascript-0.3.1-m5/`、`patches/m5-instrumentation.patch`、`M5_MANIFEST.json` | 完成（v1 `40128293… → efd3ed81…`；v2/M5-E.1 `→ 03023109…`，patch 14,903 B / sha `9af8019c…`） |
+| vendor 副本 + 25 处断言式补丁 | `scripts/m5_build_vendor.cjs` → `vendor/ffjavascript-0.3.1-m5/`、`patches/m5-instrumentation.patch`、`M5_MANIFEST.json` | 完成（v1 `40128293… → efd3ed81…`；v2/M5-E.1 `→ 03023109…`，patch 14,903 B / sha `9af8019c…`） |
 | `--require` 重定向 + 自证 | `scripts/m5_hook.cjs` | 完成（Worker 线程早退；`resolve` 非 vendor 即 `exit(3)`） |
 | 三模式驱动 | `scripts/measure_m5.ps1 -Mode pristine\|vendor\|trace` | 完成（委托 `measure_snarkjs.ps1`，Windows 口径与 M4.1 一致） |
 | L1 门槛 | `scripts/m5_check_l1.cjs` | **p10 / p16 / p18 全 PASS**（237 / 360 / 445 次调用；`site` 100% 比对，`group`/`s_g` 只在 MSM 上可比） |
@@ -798,13 +808,29 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
   1. `payloadBytes()` 拆成 `clone_buffer_bytes` / `wasm_alloc_bytes` / `worker_output_bytes`；
      旧口径使 batch 虚高 3.0×、FFT 虚高 2.2×。
   2. `grow_events[]` 增加 `t_hr`（`alloc()` 内取），`anchor` 增加 `t0_hr`，任务增加 `t_hr_start/end`。
-     容量因此是精确阶梯函数：在途峰那一刻 **C = 1,484.4 / 404.4 MiB**（终值的 93.9% / 94.8%），
-     **在途与容量同时到顶**。
+     容量因此是精确阶梯函数：在途峰那一刻 **C = 1,465.5 / 400.9 MiB**（终值的 **92.7% / 94%**），
+     **在途与容量高度重叠**（但各自极大值不在同一瞬间，在途峰比最后一处 grow 早 5.4 s / 2.1 s）。
   3. 峰值时刻不再计算残差，只同刻并列；结束残差只在 `in-flight = 0` 的时刻计算，
      下界 **829–1,184 / 1,111–1,218 MiB**，且以"最后一个任务完成"为界（之后是 teardown）。
   4. L1 增加 `site`/`group`/`s_g` 与 FFT 任务数；L2 增加逐 Worker 容量历史连续性与 `len`/`top` 对账。
   5. 离线重算脚本 `scripts/m5e_inflight.cjs` 可在 M5-D 的旧日志上直接跑，不需要重跑实验。
   优化代码仍不写：残差没有拆开之前，任何改动的收益都无法归因。
+- **M5-E.2（本版，已完成）**：在 M5-E.1 基础上做七处收紧，`docs/M5_ATTRIBUTION.md` 整体改写为单轮验证版。
+  1. **epoch 对齐**（修 A）：Windows 采样器的 `.NET Stopwatch` 与 Node `process.hrtime.bigint()` 无共同原点；
+     采样时间线加 `start_epoch_ms`、`anchor` 加 `t0_epoch_ms`，两端以绝对 epoch 毫秒对齐，归因产物打印 `ws_alignment=epoch-aligned`。
+  2. **grow 时间戳前后各取一次**（修 E）：`grow_events[]` 增 `t_hr_before` / `t_hr_after`（保留 `t_hr` 向后兼容），
+     L2 核对二者均落在任务窗口内且逐 Worker 单调。
+  3. **FFT `chunks_bytes` 修零**（修 D）：原在 `delete chunks[i]` 之后才统计，恒为 0；改为删除前统计，p18 / p16 现为 16 / 4 MiB；
+     `fft_assembly` 另增 `t_hr_start / t_hr_end`。
+  4. **三种字节量分开的真正理由**（修 C）：克隆字节与 WASM 副本是**两个不同内存对象**，可能同时存活；
+     WASM 容量是地址空间 ≠ 驻留；遥测无法把任一量换算成 WS。相加无意义，**不是**"重复计算同一段内存"。
+  5. **clone ≠ WASM 分配**（修 F）：p18 clone 10,744.8 MiB ≠ WASM 11,051.2 MiB（多 306.4 MiB），
+     p16 3,025.2 ≠ 3,103.3（多 78.1）；`worker_output_bytes`（`GET` 请求）与 `out_bytes`（真实拷贝）分开报告。
+  6. **同时性表述收紧**（修 B）：在途峰那一刻容量已达终值 92.7% / 94%，但两者极大值不在同一瞬间；
+     "把在途与容量相加当峰值预测"仍错，理由改为上条三个"不能换算"。
+  7. **L1 / L2 健壮性**（修 G）：L1 要求 MSM 子集完整；L2 修 `alloc_top` 比对、缺失字节字段即 FAIL、
+     `worker_output_bytes` 与 `out_bytes` 交叉校验。
+  只跑一轮验证（p16 / p18 各一次 `trace`，不扩 power、不动算法），不写优化代码。
 
 > **边界声明**：A.2 是本项目**最后一次静态设计校准**（本轮只做了评审勘误，不构成新修订）。此后不再靠纸面
 > 预算推导内存峰值——所有数字要么来自探针，要么明确标注为"边界假设"。

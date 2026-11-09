@@ -4320,10 +4320,24 @@ function thread(self) {
             const currentPages = memory.buffer.byteLength / 0x10000;
             let requiredPages = Math.floor((u32[0] + length) / 0x10000)+1;
             if (requiredPages>MAXMEM) requiredPages=MAXMEM;
-            if (M5_CUR) M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
-                from_pages: currentPages, to_pages: requiredPages, top: u32[0],
-                t_hr: M5_HR ? M5_HR() : null});
-            memory.grow(requiredPages-currentPages);
+            if (M5_CUR) {
+                // M5-E.2: record the grow on BOTH sides of memory.grow() so the
+                // analyser can treat [t_hr_before, t_hr_after] as the capacity
+                // change window. t_hr keeps the pre-call value for backward
+                // compatibility with any reader that predates this split.
+                // m5top is captured BEFORE memory.grow() detaches the current
+                // linear-memory view (u32); reading u32[0] after grow yields
+                // undefined, which broke the L2 grow.top replay (grow_ts FAIL).
+                const m5hrB = M5_HR ? M5_HR() : null;
+                const m5top = u32[0];
+                memory.grow(requiredPages-currentPages);
+                M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
+                    from_pages: currentPages, to_pages: requiredPages, top: m5top,
+                    t_hr_before: m5hrB, t_hr: m5hrB,
+                    t_hr_after: M5_HR ? M5_HR() : null});
+            } else {
+                memory.grow(requiredPages-currentPages);
+            }
         }
         return res;
     }
@@ -5312,6 +5326,9 @@ function buildFFT(curve, groupName) {
             }
         }
 
+        let m5ChunkBytes = 0;
+        for (let i=0; i<nChunks; i++) m5ChunkBytes += (chunks[i] ? chunks[i].byteLength : 0);
+        const m5AsmT0hr = (typeof process !== "undefined" && process.hrtime && process.hrtime.bigint) ? String(process.hrtime.bigint()) : null;
         if (buff instanceof BigBuffer) {
             buffOut = new BigBuffer(nPoints*sOut);
         } else {
@@ -5335,12 +5352,14 @@ function buildFFT(curve, groupName) {
         }
 
         if (M5 && M5.on) {
-            let chunksBytes = 0;
-            for (let i=0; i<nChunks; i++) chunksBytes += (chunks[i] ? chunks[i].byteLength : 0);
-            M5.emit({ev: 'fft_assembly', call_id: m5c ? m5c.call_id : null, site: loggerTxt || 'fft',
-                n_points: nPoints, s_in: sIn, s_mid: sMid, s_out: sOut,
-                copy_bytes: nPoints * sIn, chunks_bytes: chunksBytes, out_bytes: buffOut.byteLength});
-        }
+        // M5-E.2: chunks_bytes is counted BEFORE the delete loop (see the
+        // counting block inserted just above the BigBuffer branch), so it
+        // reflects the real transient working set of the assembly, not 0.
+        M5.emit({ev: 'fft_assembly', call_id: m5c ? m5c.call_id : null, site: loggerTxt || 'fft',
+            n_points: nPoints, s_in: sIn, s_mid: sMid, s_out: sOut,
+            copy_bytes: nPoints * sIn, chunks_bytes: m5ChunkBytes, out_bytes: buffOut.byteLength,
+            t_hr_start: m5AsmT0hr, t_hr_end: (typeof process !== "undefined" && process.hrtime && process.hrtime.bigint) ? String(process.hrtime.bigint()) : null});
+    }
         if (returnArray) {
             return buffer2array(buffOut, sOut);
         } else {

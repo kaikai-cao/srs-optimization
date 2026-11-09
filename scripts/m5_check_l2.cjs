@@ -75,6 +75,8 @@ function main() {
   let grows = 0;
   let maxPages = 0;
   const lastAfter = new Map(); // worker -> wasm_after of its previous task
+  const lastGrowTs = new Map(); // worker -> last grow t_hr_after (monotonicity)
+  const growTsChecks = { n: 0, bad: 0 };
 
   for (const t of tasks) {
     const base = t.alloc_base;
@@ -129,7 +131,7 @@ function main() {
         }
       }
     }
-    if (t.alloc_top !== undefined && t.alloc_top !== undefined) {
+    if (t.alloc_top != null) {
       const expectTop = (() => {
         let x = base;
         for (const len of allocs) {
@@ -144,27 +146,66 @@ function main() {
       }
     }
 
-    // byte accounting cross-check: main-thread command scan vs worker alloc list
+    // byte accounting cross-check: main-thread command scan vs worker alloc list.
+    // A missing REQUIRED field is itself a failure -- the old code silently skipped
+    // the whole check when wasm_alloc_bytes was absent (M5-E.2 review).
     const send = sends.get(t.task_id);
-    if (send && send.wasm_alloc_bytes !== undefined && send.wasm_alloc_bytes !== null) {
+    if (send) {
       byteCheck.n += 1;
-      const sumAllocs = allocs.reduce((x, y) => x + y, 0);
-      if (send.wasm_alloc_bytes !== sumAllocs) {
+      if (send.wasm_alloc_bytes === undefined || send.wasm_alloc_bytes === null) {
         byteCheck.bad += 1;
-        if (byteCheck.bad <= 5) {
-          problems.push(
-            `task ${t.task_id}: task_send.wasm_alloc_bytes ${send.wasm_alloc_bytes} != sum(allocs) ${sumAllocs}`
-          );
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: task_send.wasm_alloc_bytes missing (required)`);
+      } else {
+        const sumAllocs = allocs.reduce((x, y) => x + y, 0);
+        if (send.wasm_alloc_bytes !== sumAllocs) {
+          byteCheck.bad += 1;
+          if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: task_send.wasm_alloc_bytes ${send.wasm_alloc_bytes} != sum(allocs) ${sumAllocs}`);
         }
       }
-      if (send.clone_buffer_bytes !== (t.allocset_bytes || 0) + (t.set_bytes || 0)) {
+      if (send.clone_buffer_bytes === undefined || send.clone_buffer_bytes === null) {
         byteCheck.bad += 1;
-        if (byteCheck.bad <= 5) {
-          problems.push(
-            `task ${t.task_id}: task_send.clone_buffer_bytes ${send.clone_buffer_bytes} != allocset+set ${(t.allocset_bytes || 0) + (t.set_bytes || 0)}`
-          );
-        }
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: task_send.clone_buffer_bytes missing (required)`);
+      } else if (send.clone_buffer_bytes !== (t.allocset_bytes || 0) + (t.set_bytes || 0)) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: task_send.clone_buffer_bytes ${send.clone_buffer_bytes} != allocset+set ${(t.allocset_bytes || 0) + (t.set_bytes || 0)}`);
       }
+      // GET request length (what the worker was asked to return) vs the actual
+      // returned copy. worker_output_bytes is the request size; out_bytes is the
+      // copy the worker actually produced -- they must agree.
+      if (send.worker_output_bytes === undefined || send.worker_output_bytes === null) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: task_send.worker_output_bytes missing (required)`);
+      } else if (t.out_bytes === undefined || t.out_bytes === null) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: worker_task.out_bytes missing (required)`);
+      } else if (send.worker_output_bytes !== t.out_bytes) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 10) problems.push(`task ${t.task_id}: GET request ${send.worker_output_bytes} != out_bytes ${t.out_bytes}`);
+      }
+    }
+
+    // grow timestamps: M5-E.2 added t_hr_before / t_hr_after around memory.grow().
+    // They must sit inside the task's worker window and be monotonic per worker.
+    const ge = t.grow_events || [];
+    for (const g of ge) {
+      if (g.t_hr_before == null || g.t_hr_after == null) continue; // absent on old traces: skip
+      growTsChecks.n += 1;
+      const tb = BigInt(g.t_hr_before);
+      const ta = BigInt(g.t_hr_after);
+      if (t.t_hr_start != null && tb < BigInt(t.t_hr_start)) {
+        growTsChecks.bad += 1;
+        if (growTsChecks.bad <= 10) problems.push(`task ${t.task_id} (w${t.worker}): grow t_hr_before ${g.t_hr_before} < task t_hr_start ${t.t_hr_start}`);
+      }
+      if (t.t_hr_end != null && ta > BigInt(t.t_hr_end)) {
+        growTsChecks.bad += 1;
+        if (growTsChecks.bad <= 10) problems.push(`task ${t.task_id} (w${t.worker}): grow t_hr_after ${g.t_hr_after} > task t_hr_end ${t.t_hr_end}`);
+      }
+      const prev = lastGrowTs.get(t.worker);
+      if (prev !== undefined && tb < prev) {
+        growTsChecks.bad += 1;
+        if (growTsChecks.bad <= 10) problems.push(`worker ${t.worker}: grow t_hr_before ${g.t_hr_before} < previous grow t_hr_after ${prev} -- not monotonic`);
+      }
+      lastGrowTs.set(t.worker, ta);
     }
 
     grows += observed.length;
@@ -206,7 +247,8 @@ function main() {
   }
   const chained = lastAfter.size;
   console.log(`history : ${tasks.length - chained === 0 ? chained : chained} worker histories chained (wasm_after -> next wasm_before)`);
-  console.log(`bytes   : ${byteCheck.n - byteCheck.bad}/${byteCheck.n} tasks agree on clone_buffer_bytes and wasm_alloc_bytes`);
+  console.log(`bytes   : ${byteCheck.n - byteCheck.bad}/${byteCheck.n} tasks agree on clone_buffer_bytes, wasm_alloc_bytes and GET/out_bytes`);
+  console.log(`grow_ts : ${growTsChecks.n - growTsChecks.bad}/${growTsChecks.n} grow events inside their task window and monotonically ordered per worker`);
 
   const rows = [...perWorker.entries()].sort((a, b) => a[0] - b[0]);
   console.log('\nworker  tasks   max pages   alloc_base   replay fails');

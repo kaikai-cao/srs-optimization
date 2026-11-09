@@ -963,3 +963,58 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 - **没做的事**：不写优化代码、不改依赖、不跑 p20/p21、`m1-m2-frozen` 未动。
 - **下一步**：残差仍未拆开。要拆它需要 `-HeapSampleMs` 时间序列 + 主线程 `array_buffers` 的寿命归因，
   而不是继续在静态模型上迭代。
+
+---
+
+## M5-E.2｜口径与时间线校准（2026-11-09，单轮验证）
+
+- **触发**：M5-E.1 评审确认 `d375e41` 的探针确实把三种字节口径拆开、并补了 Worker 内部的 grow 时间戳，
+  且 M5-E.1 撤回 M5-E"两者不同时在场"的结论**成立**；但评审又提出七处需修正（A–G）才能冻结归因报告。
+- **范围边界（与用户确认）**：修完七处后，p16 / p18 **各只跑一轮必要验证**（`_e2_r1`），
+  不扩展 power、不动算法、不写优化代码。
+- **探针改动（对应评审项）**：
+  - **A. 时间线对齐（epoch alignment）**：Windows `.NET Stopwatch`（采样器）与 Node
+    `process.hrtime.bigint()`（探针）没有共同原点。新增 `start_epoch_ms`（timeline）+ `t0_epoch_ms`（anchor），
+    把两组相对时钟换算到绝对 epoch 毫秒；探针侧标 `ws_alignment=epoch-aligned`。
+  - **B. grow 时间戳前/后拆分**：`grow_events[]` 由单个 `t_hr` 改为 `t_hr_before`（调用 `memory.grow` **前**）、
+    `t_hr`（=before，向后兼容）、`t_hr_after`（**后**）。L2 同时校验"落在任务窗口内"与"逐 Worker 单调"。
+  - **C. WASM 缓冲脱钩保护**：`memory.grow()` 之后旧 `memory.buffer` 视图被**分离**，读 `u32[0]` 会得到
+    `undefined`。改为在 grow **之前**先 `m5top = u32[0]` 捕获页顶。
+  - **D. FFT chunks 计数顺序**：`ffd()` 在 `delete chunks[i]` **之前**计 chunks 数，避免少算；
+    `fft_assembly` 事件补 `t_hr_start` / `t_hr_end`。
+  - **E. 主线程 `_fft` 取时修复**：`_fft` 是模块级、跑在主线程，看不到 Worker 作用域的 `M5_HR`；
+    改用 `process.hrtime.bigint()` 直接取时，才能和 Worker 内 grow 时间戳放同一根轴。
+  - **F. PATCHES 计数修正**：`scripts/m5_build_vendor.cjs` 的 `PATCHES` 实为 **25** 处
+    （P1–P22 后接 P24@731、P23@780、P24@794），文档原写"24"已改正。
+  - **G. 运行标签统一**：M5-E.1 的 `_e1i_a1` / `_e1i_b1` 交错标签全部统一为单轮 `_e2_r1`，
+    归因报告改写为"单轮验证运行（r1）"口径，不再并列三对。
+- **L1 / L2 / 归因重跑（各一轮）**：
+  - p18：探针事件 60,960；L1 445/445 调用、20,145 任务；L2 180 次 grow 逐条回放相等、0 fails、
+    字节双向交叉校验 100%、`alloc_base` 全为 102,328 B。
+  - p16：探针事件 50,178；L1 360/360 调用、16,582 任务；L2 110 次 grow 全部相等、0 fails、交叉校验 100%。
+- **r1 关键数字**：
+  - **p18**：在途峰 **987.4 MiB** @ t=14,805 ms（worker）/ 14,772 ms（post）；
+    `C(t_peak)=1,465.5 MiB = 92.7%` 的 `C(final)=1,580.5 MiB`；最后一次 grow @ t=20,172 ms
+    （在途峰后 **5,367 ms**）；`WS(end)−C(final)=269.8 MiB`（WS(end)=1,850.3，基线 −178.6）；
+    clone 10,744.8 / WASM 11,051.2（+306.4）/ out 785.8 MiB；FFT 在途 13.5 MiB；
+    `fft_assembly 16+16+16=48 MiB`；`chunks_bytes 16 MiB`（M5-E.1 误为 0）。
+  - **p16**：在途峰 **265.1 MiB** @ t=4,210 ms（worker）/ 4,201 ms（post）；
+    `C(t_peak)=400.9 MiB = 94%` 的 `C(final)=426.6 MiB`；最后一次 grow @ t=6,305 ms
+    （在途峰后 **2,095 ms**）；`WS(end)−C(final)=485.7 MiB`（WS(end)=912.4，基线 40.8）；
+    clone 3,025.2 / WASM 3,103.3（+78.1）/ out 197.5 MiB；FFT 在途 3.4 MiB；
+    `fft_assembly 4+4+4=12 MiB`；`chunks_bytes 4 MiB`。
+- **措辞变更（对应评审七处）**：
+  - §0 结论：在途峰不再写"模型=实测 100%"，改为单一标量 987.4 / 265.1 MiB；
+    同时性由"同时到顶"改为"**高度重叠，但各自极大值不在同一瞬间**"（92.7% / 94%，
+    峰值后仍有 5.4 s / 2.1 s 才发生最后一次 grow，706 MiB 的差距正来自这段未闭合的扩容）；
+    字节总量明确 `clone ≠ WASM`（10,744.8 vs 11,051.2，+306.4 / 3,025.2 vs 3,103.3，+78.1），
+    out 785.8 / 197.5；残差只给单轮 269.8 / 485.7；FFT 13.5 MiB（非 14），chunks 0→16 MiB。
+  - §7 H1：FFT 在途 13.5 / 3.4 MiB，主线程副本合计 48 / 12 MiB；H4：p18 结束残差下界 269.8 MiB（0.26 GiB），
+    明确"仅作下界、不跨会话比绝对值"。
+  - §8 运行标签 `_e1i_*` → 单轮 `_e2_r1`；"24 处断言式补丁" → "25 处"。
+- **没做的事**：不写优化代码、不扩 power、不跑 p20/p21、`m1-m2-frozen` 未动；原始 trace 仍留本地，
+  只入库 `.md` 归因（遵守 `.gitignore`）。
+- **入库产物**：`scripts/` 探针改动、`vendor/ffjavascript-0.3.1-m5/`（重建）、
+  `patches/m5-instrumentation.patch`、`M5_MANIFEST.json`、
+  三份文档（`M5_ATTRIBUTION.md` / `M5_PROBE_DESIGN.md` / `EXPERIMENT_LOG.md`）、
+  `results/processed/m5e_p1{6,8}_r1.md`。

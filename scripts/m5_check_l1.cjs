@@ -91,6 +91,7 @@ function main() {
   const expected = plan.calls;
   const problems = [];
   const compared = { site: 0, group: 0, s_g: 0 };
+  const required = { group: 0, s_g: 0 };
 
   if (calls.length !== expected.length) {
     problems.push(`call count: expected ${expected.length}, observed ${calls.length}`);
@@ -121,16 +122,33 @@ function main() {
         problems.push(`#${i} ${e.kind}: site expected '${e.probe_site}' (plan '${e.site}'), observed '${o.site}'`);
       }
     }
-    if (e.group !== undefined && e.group !== null && o.group !== undefined && o.group !== null) {
-      compared.group += 1;
-      if (o.group !== e.group) {
-        problems.push(`#${i} ${e.kind} ${e.site}: group expected ${e.group}, observed ${o.group}`);
+    // group / s_g are what actually catch a G1/G2 or section swap. The probe only
+    // emits them on MSM (multiExp) calls -- the M5.plan('msm', …, {group, s_g}) path;
+    // batch/fft sends never carry them. So the REQUIRED identity subset is the MSM
+    // calls; for those a missing observed field is a FAILURE, not a skip (M5-E.2).
+    // The plan also tags batch/fft with group=Fr as a scalar-field label, but the
+    // checker must not require a field the probe cannot report.
+    const isMsm = e.kind === 'msm';
+    if (isMsm && e.group !== undefined && e.group !== null) {
+      required.group += 1;
+      if (o.group === undefined || o.group === null) {
+        problems.push(`#${i} ${e.kind} ${e.site}: plan expects group=${e.group} but probe did not record group -- MSM identity check incomplete`);
+      } else {
+        compared.group += 1;
+        if (o.group !== e.group) {
+          problems.push(`#${i} ${e.kind} ${e.site}: group expected ${e.group}, observed ${o.group}`);
+        }
       }
     }
-    if (e.s_g !== undefined && e.s_g !== null && o.s_g !== undefined && o.s_g !== null) {
-      compared.s_g += 1;
-      if (o.s_g !== e.s_g) {
-        problems.push(`#${i} ${e.kind} ${e.site}: s_g expected ${e.s_g}, observed ${o.s_g}`);
+    if (isMsm && e.s_g !== undefined && e.s_g !== null) {
+      required.s_g += 1;
+      if (o.s_g === undefined || o.s_g === null) {
+        problems.push(`#${i} ${e.kind} ${e.site}: plan expects s_g=${e.s_g} but probe did not record s_g -- MSM identity check incomplete`);
+      } else {
+        compared.s_g += 1;
+        if (o.s_g !== e.s_g) {
+          problems.push(`#${i} ${e.kind} ${e.site}: s_g expected ${e.s_g}, observed ${o.s_g}`);
+        }
       }
     }
 
@@ -155,10 +173,16 @@ function main() {
   console.log(`calls    : expected ${expected.length}, observed ${calls.length}`);
   console.log(`tasks    : ${sends.length} task_send (${unlabeled} unlabeled, ${sends.length - unlabeled} attributed)`);
   console.log(`kinds    : ${[...seenKinds].sort().join(', ')}`);
-  console.log(`identity : site ${compared.site}/${n}, group ${compared.group}/${n}, s_g ${compared.s_g}/${n} compared`);
+  console.log(`identity : site ${compared.site}/${n}, group ${compared.group}/${required.group || n}, s_g ${compared.s_g}/${required.s_g || n} compared`);
 
   if (compared.site !== n) {
     problems.push(`identity: only ${compared.site}/${n} calls had a probe_site mapping -- the site check is incomplete`);
+  }
+  if (required.group > 0 && compared.group !== required.group) {
+    problems.push(`identity: group compared on only ${compared.group}/${required.group} plan-labeled calls -- the group check is incomplete`);
+  }
+  if (required.s_g > 0 && compared.s_g !== required.s_g) {
+    problems.push(`identity: s_g compared on only ${compared.s_g}/${required.s_g} plan-labeled calls -- the s_g check is incomplete`);
   }
 
   if (problems.length) {
