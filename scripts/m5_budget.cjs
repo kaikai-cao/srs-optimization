@@ -1,39 +1,58 @@
 #!/usr/bin/env node
 /**
- * M5-A static allocation ledger calculator.
+ * M5-A static allocation ledger calculator (rev A.1).
  *
- * This file does NOT instrument anything, does NOT monkey-patch a prototype, and
- * never launches snarkjs. It only re-derives, from the chunking arithmetic in
- * ffjavascript 0.3.1, the buffer sizes that the library WILL request, so that the
- * M5 probe design has a falsifiable prediction to be checked against.
+ * Does NOT instrument anything, does NOT monkey-patch a prototype, and never
+ * launches snarkjs. It only re-derives, from the chunking arithmetic in
+ * ffjavascript 0.3.1 / snarkjs 0.7.6, the buffer sizes that the library WILL
+ * request, so that the M5 probe design has a falsifiable prediction.
+ *
+ * REV A.1 -- scalar width correction. Three MSM families must be kept apart,
+ * because snarkjs feeds them different scalar widths:
+ *
+ *   processSection (phase 1)   scalars = getRandomBytes(4*(n-1))   ->  4 B
+ *   verifyPower.resTau         buff_r  = new Uint32Array(nPoints)  ->  4 B
+ *   verifyPower.resLagrange    buff_r  = BigBuffer(nPoints*Fr.n8)  -> 32 B
+ *       (after batchToMontgomery -> fft -> batchFromMontgomery)
+ *
+ * The 18x bit-chunk amplification in the earlier draft applies ONLY to the
+ * 32 B path. A 4 B path divides the scalar bit length by 8 and therefore
+ * needs ~3 bit-chunks, not ~18.
  *
  * Transcribed constants (verify against the installed tree):
  *   ffjavascript/src/threadman.js:21             MEM_SIZE  = 25 pages (1.6 MiB)
  *   ffjavascript/src/threadman.js:104-119        concurrency = min(os.cpus(),64)
  *   ffjavascript/src/threadman_thread.js:4       MAXMEM    = 32767 pages (2 GiB)
- *   ffjavascript/src/threadman_thread.js:44-56   alloc() growth rule (top+len headroom)
+ *   ffjavascript/src/threadman_thread.js:44-56   alloc() growth rule (top+len)
  *   ffjavascript/src/engine_multiexp.js:3-8      pTSizes[]
- *   ffjavascript/src/engine_multiexp.js:92-137   chunkSize / nChunks / slice per chunk
- *   ffjavascript/src/engine_fft.js:13,109-115    MAX_BITS_THREAD=14, chunk split loop
- *   ffjavascript/src/bigbuffer.js:2              PAGE_SIZE = 1 GiB (single page below 1 GiB)
- *   ffjavascript/src/utils.js:206                log2() is FLOOR log2
+ *   ffjavascript/src/engine_multiexp.js:112-137  sScalar, bitChunk, chunkSize
+ *   ffjavascript/src/engine_fft.js:13,109-115    MAX_BITS_THREAD=14, split loop
+ *   ffjavascript/src/bigbuffer.js:2              PAGE_SIZE = 1 GiB
+ *   snarkjs/src/powersoftau_verify.js:340-396    processSection (4 B scalars)
+ *   snarkjs/src/powersoftau_verify.js:421-490    verifyPower (4 B then 32 B)
+ *
+ * Assumption that is NOT verified and must be measured in M5-B:
+ *   the worker allocator pointer u32[0] after module init is taken as 0.
+ *   A non-zero static-data offset only pushes capacities up by whole pages.
  *
  * Usage:
  *   node scripts/m5_budget.cjs --power 18 --operation prepared_verify
- *   node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
+ *   node scripts/m5_budget.cjs --power 18 --operation phase1
+ *   node scripts/m5_budget.cjs --power 18 --operation prepare_phase2
+ *   node scripts/m5_budget.cjs --power 18 --operation prepared_verify --json
  */
 
 'use strict';
 
 const os = require('os');
 
-// ---- constants transcribed from ffjavascript 0.3.1 -------------------------
+// ---- constants transcribed from the installed tree -------------------------
 const MEM_SIZE_PAGES = 25;
 const MAXMEM_PAGES = 32767;
 const PAGE_BYTES = 65536;
-const BIGBUFFER_PAGE = 1 << 30;
 const MAX_CHUNK_SIZE = 1 << 22; // engine_multiexp.js:92
 const MIN_CHUNK_SIZE = 1 << 10; // engine_multiexp.js:93
+const PHASE1_CHUNK = 1 << 16; // powersoftau_verify.js:341 MAX_CHUNK_SIZE
 const MAX_BITS_THREAD = 14; // engine_fft.js:13
 const PTSIZES = [
   1, 1, 1, 1, 2, 3, 4, 5,
@@ -42,15 +61,16 @@ const PTSIZES = [
   17, 17, 17, 17, 17, 17, 17, 17,
 ];
 
-// BLS12-381 point / field element sizes (sG = F.n8 * 2 for affine, * 3 for jacobian)
+// BLS12-381 sizes
 const S = { G1aff: 96, G1jac: 144, G2aff: 192, G2jac: 288, Fr: 32 };
+const SCALAR_4B = 4; // polyfill scalar width used by snarkjs in two places
+const SCALAR_FR = 32;
 
 const MiB = (b) => b / 1048576;
 const f1 = (x) => Math.round(x * 10) / 10;
 const f2 = (x) => Math.round(x * 100) / 100;
 
 function log2floor(v) {
-  // replicates utils.js:206 for v > 0
   let x = v;
   return (
     ((x & 0xffff0000) !== 0 ? ((x &= 0xffff0000), 16) : 0) |
@@ -64,11 +84,9 @@ function log2floor(v) {
 /**
  * Replays threadman_thread.js alloc() for one task.
  * `allocs` are the byte lengths passed, in order, by ALLOC/ALLOCSET.
- * Returns the worker's linear-memory capacity after the task, plus the raw
- * allocation top (the value u32[0] reaches) for overlap bookkeeping.
  */
 function replayWorkerMemory(allocs, initialPages = MEM_SIZE_PAGES) {
-  let top = 0; // static data offset of the wasm module; upper bound = 0
+  let top = 0; // ASSUMED allocator base offset (see header note)
   let bytes = initialPages * PAGE_BYTES;
   let grows = 0;
   const trace = [];
@@ -76,10 +94,8 @@ function replayWorkerMemory(allocs, initialPages = MEM_SIZE_PAGES) {
     while (top & 3) top++;
     top += len;
     // threadman_thread.js:49 -- the condition adds `length` a SECOND time on top
-    // of the already-incremented top, so the memory must fit top + len, i.e.
-    // roughly 2x the first allocation plus the rest.
+    // of the already-incremented top, so the memory must fit top + len.
     if (top + len > bytes) {
-      const curPages = bytes / PAGE_BYTES;
       let reqPages = Math.floor((top + len) / PAGE_BYTES) + 1;
       if (reqPages > MAXMEM_PAGES) reqPages = MAXMEM_PAGES;
       bytes = reqPages * PAGE_BYTES;
@@ -90,8 +106,11 @@ function replayWorkerMemory(allocs, initialPages = MEM_SIZE_PAGES) {
   return { bytes, top, grows, trace };
 }
 
-/** engine_multiexp.js _multiExp + _multiExpChunk */
-function multiExpLedger(nPoints, concurrency, sG, sScalar) {
+/**
+ * One _multiExp call: engine_multiexp.js:112-137.
+ * sScalar is derived as floor(scalars.byteLength / nPoints); pass it explicitly.
+ */
+function msmCall(nPoints, sG, sScalar, concurrency, jacBytes) {
   const bitChunkSize = PTSIZES[log2floor(nPoints)];
   const nBitChunks = Math.floor((sScalar * 8 - 1) / bitChunkSize) + 1;
 
@@ -99,70 +118,134 @@ function multiExpLedger(nPoints, concurrency, sG, sScalar) {
   if (chunkSize > MAX_CHUNK_SIZE) chunkSize = MAX_CHUNK_SIZE;
   if (chunkSize < MIN_CHUNK_SIZE) chunkSize = MIN_CHUNK_SIZE;
 
-  const tasks = [];
+  const pointChunks = [];
   for (let i = 0; i < nPoints; i += chunkSize) {
-    const n = Math.min(nPoints - i, chunkSize);
-    const bases = n * sG;
-    const scalars = n * sScalar;
-    for (let c = 0; c < nBitChunks; c++) {
-      const mem = replayWorkerMemory([bases, scalars, S.G1jac]);
-      tasks.push({
-        points: n,
-        basesBytes: bases,
-        scalarsBytes: scalars,
-        sendBytes: bases + scalars, // structured clone payload (no transfer list)
-        recvBytes: S.G1jac, // GET out 0
-        workerMemBytes: mem.bytes,
-        workerGrows: mem.grows,
-      });
-    }
+    pointChunks.push(Math.min(nPoints - i, chunkSize));
   }
 
-  const nPointChunks = Math.ceil(nPoints / chunkSize);
-  const byChunk = new Map();
-  for (const t of tasks) byChunk.set(t.points, (byChunk.get(t.points) || 0) + 1);
+  const perChunk = pointChunks.map((n) => {
+    const bases = n * sG;
+    const scalars = n * sScalar;
+    return {
+      points: n,
+      sendBytes: bases + scalars,
+      basesBytes: bases,
+      scalarsBytes: scalars,
+      workerMemBytes: replayWorkerMemory([bases, scalars, jacBytes]).bytes,
+      workerGrows: replayWorkerMemory([bases, scalars, jacBytes]).grows,
+    };
+  });
 
-  const totalSend = tasks.reduce((a, t) => a + t.sendBytes, 0);
-  const totalRecv = tasks.reduce((a, t) => a + t.recvBytes, 0);
-  // All point-chunks are created before the first await (one slice per chunk,
-  // shared by every bit-chunk task of that chunk), and stay referenced until
-  // Promise.all resolves.
-  const sliceRetention = nPoints * (sG + sScalar);
+  // nBitChunks tasks per point-chunk, each carrying the WHOLE point-chunk
+  const tasks = [];
+  for (const pc of perChunk) {
+    for (let b = 0; b < nBitChunks; b++) tasks.push(pc);
+  }
 
-  // First dispatch wave: queueAction -> processWorks posts to every free worker,
-  // so up to `concurrency` tasks are serialized/cloned at once.
-  const sorted = tasks.map((t) => t.sendBytes).sort((a, b) => b - a);
-  const wave1Send = sorted.slice(0, concurrency).reduce((a, b) => a + b, 0);
-
-  // Every worker that ever ran a task keeps its grown linear memory forever
-  // (allocation pointer is restored, memory is not shrunk).
-  const workerMemSorted = tasks.map((t) => t.workerMemBytes).sort((a, b) => b - a);
-  const distinctWorkers = Math.min(concurrency, tasks.length);
-  const workerMemTotal = workerMemSorted
-    .slice(0, distinctWorkers)
-    .reduce((a, b) => a + b, 0);
+  const nWorkers = Math.min(concurrency, tasks.length);
+  const memSorted = tasks.map((t) => t.workerMemBytes).sort((a, b) => b - a);
+  const sendSorted = tasks.map((t) => t.sendBytes).sort((a, b) => b - a);
 
   return {
-    kind: 'multiExp',
     nPoints,
+    sG,
+    sScalar,
     bitChunkSize,
     nBitChunks,
     chunkSize,
-    nPointChunks,
+    nPointChunks: pointChunks.length,
     taskCount: tasks.length,
-    perTaskPoints: [...byChunk.keys()],
-    perTaskSendMiB: [...byChunk.keys()].map((k) => f1(MiB(k * (sG + sScalar)))),
-    totalSendBytes: totalSend,
-    totalRecvBytes: totalRecv,
-    sliceRetentionBytes: sliceRetention,
-    wave1SendBytes: wave1Send,
-    workerMemBytes: workerMemTotal,
-    maxWorkerMemBytes: workerMemSorted[0] || 0,
-    maxWorkerGrows: Math.max(...tasks.map((t) => t.workerGrows)),
+    perTaskPointsMin: Math.min(...pointChunks),
+    perTaskPointsMax: Math.max(...pointChunks),
+    perTaskSendMax: sendSorted[0],
+    // upper bound: assumes the largest tasks land on distinct workers
+    wave1SendBytes: sendSorted.slice(0, concurrency).reduce((a, b) => a + b, 0),
+    // upper bound: same assumption applied to retained linear memory
+    workerMemBytes: memSorted.slice(0, nWorkers).reduce((a, b) => a + b, 0),
+    workerMemMinBytes: memSorted[Math.max(0, memSorted.length - 1)],
+    maxWorkerMemBytes: memSorted[0],
+    maxWorkerPages: Math.round(memSorted[0] / PAGE_BYTES),
+    noGrow: memSorted[0] <= MEM_SIZE_PAGES * PAGE_BYTES,
+    unchangedWorkerBytes: 0,
+    nWorkers,
   };
 }
 
-/** engine_fft.js _fft (mix + join), for a single non-extended transform */
+/** phase 1: the four processSection() calls before phase 2 begins */
+function phase1Ledger(power, concurrency) {
+  const sections = [
+    { name: 'tauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power * 2 - 1 },
+    { name: 'tauG2', group: 'G2', sG: S.G2aff, jac: S.G2jac, nPoints: 2 ** power },
+    { name: 'alphatauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power },
+    { name: 'betatauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power },
+  ];
+
+  const rows = sections.map((sec) => {
+    // MAX_CHUNK_SIZE = 65536 points per read; each chunk runs TWO MSMs on n-1
+    const chunkPts = [];
+    for (let i = 0; i < sec.nPoints; i += PHASE1_CHUNK) {
+      chunkPts.push(Math.min(sec.nPoints - i, PHASE1_CHUNK));
+    }
+    const worst = msmCall(
+      Math.max(...chunkPts) - 1,
+      sec.sG,
+      SCALAR_4B,
+      concurrency,
+      sec.jac
+    );
+    const small = msmCall(
+      Math.min(...chunkPts) - 1,
+      sec.sG,
+      SCALAR_4B,
+      concurrency,
+      sec.jac
+    );
+    return {
+      ...sec,
+      chunkPts,
+      nChunks: chunkPts.length,
+      msmPoints: Math.max(...chunkPts) - 1,
+      worst,
+      small,
+    };
+  });
+
+  // A worker's linear memory is a high-water mark; the worst task in phase 1
+  // decides every worker that ever ran a full-size chunk.
+  const driver = rows.reduce((a, b) => (b.worst.maxWorkerMemBytes > a.worst.maxWorkerMemBytes ? b : a));
+  const grownPages = driver.worst.maxWorkerPages;
+  const grownBytes = driver.worst.maxWorkerMemBytes;
+  const nGrownTasks = driver.worst.taskCount;
+
+  // Point-chunks: full-size ones grow a worker, the tail one does not.
+  const fullChunks = Math.max(1, driver.worst.nPointChunks - 1);
+  const grownWorkers = Math.min(concurrency, fullChunks * driver.worst.nBitChunks);
+  const initBytes = MEM_SIZE_PAGES * PAGE_BYTES;
+  const baseline = grownWorkers * grownBytes + (concurrency - grownWorkers) * initBytes;
+
+  return {
+    kind: 'phase1',
+    rows,
+    driver: driver.name,
+    grownPages,
+    grownBytesPerWorker: grownBytes,
+    grownWorkers,
+    initPerWorkerBytes: initBytes,
+    baselineBytes: baseline,
+    baselineMiB: MiB(baseline),
+    note: 'scalars are 4 B (getRandomBytes(4*(n-1))); two MSMs per 64 Ki-point chunk',
+  };
+}
+
+/** phase 2: verifyPower(p) runs resTau (4 B) and then resLagrange (32 B) */
+function verifyPowerLedger(p, concurrency) {
+  const nPoints = 2 ** p;
+  const tau = msmCall(nPoints, S.G1aff, SCALAR_4B, concurrency, S.G1jac);
+  const lag = msmCall(nPoints, S.G1aff, SCALAR_FR, concurrency, S.G1jac);
+  return { kind: 'verifyPower', p, nPoints, resTau: tau, resLagrange: lag };
+}
+
+/** engine_fft.js _fft (mix + join), single non-extended transform */
 function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
   const bits = log2floor(nPoints);
   let pointsInChunk = Math.min(1 << MAX_BITS_THREAD, nPoints);
@@ -173,15 +256,9 @@ function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
   }
   const l2Chunk = log2floor(pointsInChunk);
 
-  // engine_fft.js:73 -- buff.slice(0, byteLength). Below 1 GiB a BigBuffer slice
-  // returns a plain Uint8Array COPY of the whole input.
   const inputCopyBytes = nPoints * sIn;
-  // engine_fft.js:106 -- buffReverseBits: one tmp slice + one read slice per swap,
-  // each of eSize bytes; number of swaps is ~nPoints/2.
   const reverseBitsAllocs = Math.floor(nPoints / 2) * 2;
 
-  // mix wave: ALLOC sMid*ppc, SET from a 96*ppc slice, GET sMid*ppc (unless the
-  // single-chunk case applies)
   const mixTask = {
     sendBytes: pointsInChunk * sIn,
     recvBytes: pointsInChunk * (l2Chunk === bits ? sOut : sMid),
@@ -190,7 +267,6 @@ function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
   const mixTasks = [];
   for (let i = 0; i < nChunks; i++) mixTasks.push(mixTask);
 
-  // join waves: one task per pair, two ALLOCSET of sMid*ppc each
   let joinTasks = 0;
   let joinSend = 0;
   let joinRecv = 0;
@@ -208,20 +284,15 @@ function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
 
   const totalSend = mixTasks.reduce((a, t) => a + t.sendBytes, 0) + joinSend;
   const totalRecv = mixTasks.reduce((a, t) => a + t.recvBytes, 0) + joinRecv;
-  // A worker's linear memory is the high-water mark over EVERY task it ever ran,
-  // so the join wave (two ALLOCSET) can dominate the mix wave.
   const perWorkerMax = Math.max(mixTask.workerMemBytes, joinWorkerMemMax);
   const workerMem = Math.min(concurrency, nChunks) * perWorkerMax;
 
-  // Largest single dispatch wave: the mix wave, or the widest join wave.
-  const joinWavePeak =
-    Math.min(concurrency, nChunks / 2) * 2 * pointsInChunk * sMid;
+  const joinWavePeak = Math.min(concurrency, nChunks / 2) * 2 * pointsInChunk * sMid;
   const inflightPeak = Math.max(
     Math.min(concurrency, nChunks) * mixTask.sendBytes,
     joinWavePeak
   );
 
-  // final assembly: chunks[] still fully alive while buffOut is filled
   const chunkBytes = nChunks * pointsInChunk * sMid;
   const outBytes = nPoints * sOut;
 
@@ -234,127 +305,157 @@ function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
     l2Chunk,
     mixTasks: nChunks,
     joinTasks,
+    inputCopyBytes,
+    reverseBitsAllocs,
     totalSendBytes: totalSend,
     totalRecvBytes: totalRecv,
     inflightPeakBytes: inflightPeak,
-    inputCopyBytes,
-    reverseBitsAllocs,
     workerMemBytes: workerMem,
-    maxWorkerMemBytes: perWorkerMax,
-    assemblyPeakBytes: inputCopyBytes + chunkBytes + outBytes,
+    assemblyChunksBytes: chunkBytes,
+    assemblyOutBytes: outBytes,
+    assemblyPeakBytes: Math.min(inputCopyBytes + chunkBytes + outBytes, 2 ** 53),
   };
 }
 
-/** engine_batchconvert.js -- exactly `concurrency` chunks, no whole-buffer copy */
-function batchConvertLedger(bytes, concurrency, sIn, sOut) {
-  const nPoints = Math.floor(bytes / sIn);
-  const per = Math.floor(nPoints / concurrency);
-  const inChunk = per * sIn;
-  const outChunk = per * sOut;
-  return {
-    kind: 'batchConvert',
-    nPoints,
-    chunks: concurrency,
-    totalSendBytes: inChunk * concurrency,
-    totalRecvBytes: outChunk * concurrency,
-    workerMemBytes:
-      Math.min(concurrency, concurrency) *
-      replayWorkerMemory([inChunk, outChunk]).bytes,
-    outBufferBytes: nPoints * sOut,
+// ---- reporting -------------------------------------------------------------
+function printPreparedVerify(power, concurrency) {
+  const p1 = phase1Ledger(power, concurrency);
+  const big = verifyPowerLedger(power + 1, concurrency);
+  const mid = verifyPowerLedger(power, concurrency);
+  const fft = fftLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr, S.Fr);
+
+  console.log(`### prepared_verify @ power ${power} (concurrency ${concurrency})\n`);
+  console.log('#### A. phase 1 -- processSection, 4 B scalars (powersoftau_verify.js:361)\n');
+  console.log('| section | group | points | 64 Ki-chunks | MSM points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages | workers grown |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of p1.rows) {
+    console.log(
+      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.worst.bitChunkSize} | ${r.worst.nBitChunks} | ${r.worst.nPointChunks} | ${r.worst.taskCount} | ${f1(MiB(r.worst.perTaskSendMax))} | ${f1(MiB(r.worst.wave1SendBytes))} | ${r.worst.maxWorkerPages} | ${r.worst.noGrow ? 0 : Math.min(concurrency, (r.worst.nPointChunks - 1) * r.worst.nBitChunks)} |`
+    );
+  }
+  console.log(
+    `\nphase-1 baseline (driver: ${p1.driver}): ${p1.grownWorkers} workers x ${p1.grownPages} pages (${f2(MiB(p1.grownBytesPerWorker))} MiB) + rest at 25 pages = **${f1(p1.baselineMiB)} MiB**\n`
+  );
+
+  console.log('#### B. phase 2 -- resTau, 4 B scalars (powersoftau_verify.js:425,452)\n');
+  console.log('| p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages |');
+  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  console.log(
+    `| ${big.p} | ${big.nPoints} | ${big.resTau.bitChunkSize} | ${big.resTau.nBitChunks} | ${big.resTau.nPointChunks} | ${big.resTau.taskCount} | ${f1(MiB(big.resTau.perTaskSendMax))} | ${f1(MiB(big.resTau.wave1SendBytes))} | ${big.resTau.maxWorkerPages} |`
+  );
+  console.log(
+    `| ${mid.p} | ${mid.nPoints} | ${mid.resTau.bitChunkSize} | ${mid.resTau.nBitChunks} | ${mid.resTau.nPointChunks} | ${mid.resTau.taskCount} | ${f1(MiB(mid.resTau.perTaskSendMax))} | ${f1(MiB(mid.resTau.wave1SendBytes))} | ${mid.resTau.maxWorkerPages} |\n`
+  );
+
+  console.log('#### C. phase 2 -- resLagrange, 32 B scalars after fft (powersoftau_verify.js:454,482)\n');
+  console.log('| p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages | worker WASM (MiB) |');
+  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  console.log(
+    `| ${big.p} | ${big.nPoints} | ${big.resLagrange.bitChunkSize} | ${big.resLagrange.nBitChunks} | ${big.resLagrange.nPointChunks} | ${big.resLagrange.taskCount} | ${f1(MiB(big.resLagrange.perTaskSendMax))} | ${f1(MiB(big.resLagrange.wave1SendBytes))} | ${big.resLagrange.maxWorkerPages} | ${f1(MiB(big.resLagrange.workerMemBytes))} |`
+  );
+  console.log(
+    `| ${mid.p} | ${mid.nPoints} | ${mid.resLagrange.bitChunkSize} | ${mid.resLagrange.nBitChunks} | ${mid.resLagrange.nPointChunks} | ${mid.resLagrange.taskCount} | ${f1(MiB(mid.resLagrange.perTaskSendMax))} | ${f1(MiB(mid.resLagrange.wave1SendBytes))} | ${mid.resLagrange.maxWorkerPages} | ${f1(MiB(mid.resLagrange.workerMemBytes))} |\n`
+  );
+
+  const inc = big.resLagrange.wave1SendBytes + (big.resLagrange.workerMemBytes - p1.baselineBytes);
+  console.log(`#### D. tauG1 phase-2 segment increment (model, same window as M4.1)\n`);
+  console.log('| term | MiB |');
+  console.log('| --- | ---: |');
+  console.log(`| resLagrange in-flight | ${f1(MiB(big.resLagrange.wave1SendBytes))} |`);
+  console.log(`| resLagrange worker WASM | ${f1(MiB(big.resLagrange.workerMemBytes))} |`);
+  console.log(`| minus phase-1 baseline | ${f1(-p1.baselineMiB)} |`);
+  console.log(`| **model increment** | **${f1(MiB(inc))}** |`);
+  console.log(`\nFr FFT @2^${big.p}: ${fft.nChunks} chunks x ${fft.pointsInChunk} pts, in-flight ${f1(MiB(fft.inflightPeakBytes))} MiB, worker WASM ${f1(MiB(fft.workerMemBytes))} MiB, input copy ${f1(MiB(fft.inputCopyBytes))} MiB`);
+  console.log('\nAll worker-memory figures assume allocator base 0 and a descending\n(schedule-favourable) task-to-worker assignment: they are UPPER bounds.\n');
+
+  return { power, concurrency, phase1: p1, resTau: big.resTau, resLagrange: big.resLagrange, fft, inc };
+}
+
+function printPhase1(power, concurrency) {
+  const p1 = phase1Ledger(power, concurrency);
+  console.log(`### phase 1 only @ power ${power} (concurrency ${concurrency})\n`);
+  console.log('| section | group | points | 64 Ki-chunks | MSM points | 4 B bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of p1.rows) {
+    console.log(
+      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.worst.bitChunkSize} | ${r.worst.nBitChunks} | ${r.worst.nPointChunks} | ${r.worst.taskCount} | ${f1(MiB(r.worst.perTaskSendMax))} | ${f1(MiB(r.worst.wave1SendBytes))} | ${r.worst.maxWorkerPages} |`
+    );
+  }
+  console.log(`\nbaseline = ${p1.grownWorkers} x ${p1.grownPages} pages + ${concurrency - p1.grownWorkers} x 25 pages = **${f1(p1.baselineMiB)} MiB** (driver: ${p1.driver})`);
+  return p1;
+}
+
+function printPreparePhase2(power, concurrency) {
+  // powersoftau_preparephase2.js:92 -- G.ifft(buff, "affine", "affine"):
+  // in/out are affine (96 B), the intermediate chunks are jacobian (144 B).
+  const big = fftLedger(2 ** (power + 1), concurrency, S.G1aff, S.G1jac, S.G1aff);
+  const mid = fftLedger(2 ** power, concurrency, S.G1aff, S.G1jac, S.G1aff);
+  console.log(`### prepare_phase2 @ power ${power} (concurrency ${concurrency})\n`);
+  console.log('| ifft | points | chunks x pts | in-flight (MiB) | recv (MiB) | worker WASM (MiB) | input copy (MiB) | chunks[] (MiB) | out (MiB) | assembly peak (MiB) |');
+  console.log('| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const [label, r] of [['tauG1 tail', big], ['largest in-section', mid]]) {
+    console.log(
+      `| ${label} | ${r.nPoints} | ${r.nChunks} x ${r.pointsInChunk} | ${f1(MiB(r.inflightPeakBytes))} | ${f1(MiB(r.totalRecvBytes))} | ${f1(MiB(r.workerMemBytes))} | ${f1(MiB(r.inputCopyBytes))} | ${f1(MiB(r.assemblyChunksBytes))} | ${f1(MiB(r.assemblyOutBytes))} | ${f1(MiB(r.assemblyPeakBytes))} |`
+    );
+  }
+  console.log('\nNo MSM in this operation: the peer path in prepared_verify does not apply.\n');
+  return { power, concurrency, big, mid };
+}
+
+// ---- CLI -------------------------------------------------------------------
+function main(argv) {
+  const arg = (name, dflt) => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
   };
-}
+  const power = Number(arg('power', 18));
+  const operation = arg('operation', 'prepared_verify');
+  const concurrency = Number(arg('concurrency', Math.min(os.cpus().length, 64)));
+  const asJson = argv.includes('--json');
 
-/** fastfile cache capacity estimate -- control row only (M4 already measured it) */
-function fastfileCapacity(readBytes, pageSize = 8192) {
-  const pages = Math.floor((readBytes * 1.1) / pageSize) + 1;
-  return { readBytes, pages, capacityBytes: pages * pageSize };
-}
-
-// ---- report ---------------------------------------------------------------
-function buildLedger(power, operation, concurrency) {
-  const p = power;
-  const n = 2 ** p;
-  const rows = [];
-
-  if (operation === 'prepared_verify') {
-    // powersoftau_verify.js:421-490 verifyPower(p): tauG1 section runs p=0..power
-    // and one extra p=power+1 (line 414-417).
-    const tau = multiExpLedger(2 ** (p + 1), concurrency, S.G1aff, S.Fr);
-    const lag = multiExpLedger(n, concurrency, S.G1aff, S.Fr);
-    const fftFr = fftLedger(2 ** (p + 1), concurrency, S.Fr, S.Fr, S.Fr);
-    const b2m = batchConvertLedger(2 ** (p + 1) * S.Fr, concurrency, S.Fr, S.Fr);
-    rows.push(['MSM tauG1 (2^(p+1) points)', tau]);
-    rows.push(['MSM lagrange (2^p points)', lag]);
-    rows.push(['Fr FFT for the shifted scalars', fftFr]);
-    rows.push(['Fr batchTo/FromMontgomery', b2m]);
-    rows.push([
-      'FastFile largest read (control)',
-      fastfileCapacity(Math.max((2 ** (p + 1) - 1) * S.G1aff, n * S.G1aff)),
-    ]);
-  } else if (operation === 'prepare_phase2') {
-    // powersoftau_preparephase2.js:56-62: p=0..power per section, plus p=power+1
-    // for section 2 (tauG1).
-    const last = fftLedger(2 ** (p + 1), concurrency, S.G1aff, S.G1jac, S.G1aff);
-    const inner = fftLedger(n, concurrency, S.G1aff, S.G1jac, S.G1aff);
-    rows.push(['ifft tauG1 tail (2^(p+1) points)', last]);
-    rows.push(['ifft largest in-section (2^p points)', inner]);
-    rows.push([
-      'FastFile largest read (control)',
-      fastfileCapacity((2 ** (p + 1) - 1) * S.G1aff),
-    ]);
-  } else {
-    throw new Error('unknown operation: ' + operation);
+  let out;
+  if (operation === 'prepared_verify') out = asJson ? null : printPreparedVerify(power, concurrency);
+  else if (operation === 'phase1') out = printPhase1(power, concurrency);
+  else if (operation === 'prepare_phase2') out = printPreparePhase2(power, concurrency);
+  else {
+    console.error(`unknown --operation ${operation} (prepared_verify | phase1 | prepare_phase2)`);
+    process.exit(2);
   }
 
-  return { power: p, operation, concurrency, rows };
-}
-
-function toMarkdown(ledger) {
-  const out = [];
-  out.push(`### ${ledger.operation} @ power ${ledger.power} (concurrency ${ledger.concurrency})`);
-  out.push('');
-  out.push('| component | tasks | chunk | in-flight send (MiB) | total send (MiB) | total recv (MiB) | worker WASM (MiB) | JS retention (MiB) |');
-  out.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  for (const [name, r] of ledger.rows) {
-    if (r.kind === 'multiExp') {
-      out.push(
-        `| ${name} | ${r.taskCount} | ${r.nPointChunks}x${r.nBitChunks} bit-chunks, ${r.perTaskPoints.join('+')} pts | ${f1(MiB(r.wave1SendBytes))} | ${f1(MiB(r.totalSendBytes))} | ${f1(MiB(r.totalRecvBytes))} | ${f1(MiB(r.workerMemBytes))} | ${f1(MiB(r.sliceRetentionBytes))} |`
-      );
-    } else if (r.kind === 'fft') {
-      out.push(
-        `| ${name} | ${r.mixTasks + r.joinTasks} | ${r.nChunks} chunks x ${r.pointsInChunk} pts | ${f1(MiB(r.inflightPeakBytes))} | ${f1(MiB(r.totalSendBytes))} | ${f1(MiB(r.totalRecvBytes))} | ${f1(MiB(r.workerMemBytes))} | ${f1(MiB(r.assemblyPeakBytes))} |`
-      );
-    } else if (r.kind === 'batchConvert') {
-      out.push(
-        `| ${name} | ${r.chunks} | ${r.chunks} chunks | ${f1(MiB(r.totalSendBytes))} | ${f1(MiB(r.totalSendBytes))} | ${f1(MiB(r.totalRecvBytes))} | ${f1(MiB(r.workerMemBytes))} | ${f1(MiB(r.outBufferBytes))} |`
-      );
-    } else {
-      out.push(
-        `| ${name} | - | read ${f1(MiB(r.readBytes))} MiB | - | - | - | - | ${f1(MiB(r.capacityBytes))} |`
-      );
-    }
+  if (asJson) {
+    const p1 = phase1Ledger(power, concurrency);
+    const big = verifyPowerLedger(power + 1, concurrency);
+    const mid = verifyPowerLedger(power, concurrency);
+    const fft = fftLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr, S.Fr);
+    const inc = big.resLagrange.wave1SendBytes + (big.resLagrange.workerMemBytes - p1.baselineBytes);
+    console.log(
+      JSON.stringify(
+        {
+          power,
+          concurrency,
+          phase1: { rows: p1.rows.map((r) => ({ name: r.name, group: r.group, points: r.nPoints, msmPoints: r.msmPoints, ...r.worst })), baselineMiB: f2(p1.baselineMiB), grownWorkers: p1.grownWorkers, grownPages: p1.grownPages, driver: p1.driver },
+          resTau: big.resTau,
+          resLagrange: big.resLagrange,
+          resTauMid: mid.resTau,
+          resLagrangeMid: mid.resLagrange,
+          fft,
+          modelIncrementMiB: f2(MiB(inc)),
+          assumptions: ['allocator base offset = 0', 'descending task-to-worker assignment (upper bound)'],
+        },
+        null,
+        2
+      )
+    );
   }
-  out.push('');
-  return out.join('\n');
+  return out;
 }
 
-function main() {
-  const argv = process.argv.slice(2);
-  const get = (name, dflt) => {
-    const i = argv.indexOf('--' + name);
-    return i >= 0 ? argv[i + 1] : dflt;
-  };
-  const power = Number(get('power', '18'));
-  const operation = get('operation', 'prepared_verify');
-  const concurrency = Number(get('concurrency', String(Math.min(os.cpus().length, 64))));
-  const ledger = buildLedger(power, operation, concurrency);
-  if (argv.includes('--json')) {
-    console.log(JSON.stringify(ledger, null, 2));
-  } else {
-    console.log(toMarkdown(ledger));
-  }
-}
+if (require.main === module) main(process.argv.slice(2));
 
-if (require.main === module) main();
-
-module.exports = { multiExpLedger, fftLedger, batchConvertLedger, replayWorkerMemory };
+module.exports = {
+  replayWorkerMemory,
+  msmCall,
+  phase1Ledger,
+  verifyPowerLedger,
+  fftLedger,
+};

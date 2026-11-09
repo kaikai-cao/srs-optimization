@@ -669,6 +669,7 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
   2. `engine_multiexp.js:119-125`：`nBitChunks = floor(255/bitChunk)+1`，`chunkSize = floor(N / (concurrency / nBitChunks))`；
      每个 bit-chunk 任务**各带整块** bases+scalars，`queueAction` **不传 transfer list** → 结构化克隆。
      克隆总量 = `nBitChunks × N × 128 B`，**与并发度无关**；在途量 ≈ `min(28, 任务数) × 单任务载荷`。
+     → **A.1 修正**：位块公式必须带标量宽度（`(8·sScalar−1)/bitChunk+1`），本条的 18 位块只对 32 B 标量成立。
   3. 全路径唯一的 transfer 是启动时每个 Worker 的 wasm 模块字节（`threadman.js:137`）。
   4. Worker 源码经 `thread.toString()` → data URL → `VM.runInThisContext`，**无模块级 `require`**，
      遥测只能随结果 `postMessage` 回传，由主线程落盘；且不能额外 `postMessage`（会被 `getOnMsg` 误判为任务完成）。
@@ -676,6 +677,8 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
   单任务 41.2/22.9 MiB，在途峰 **970 MiB**，28 个 Worker 的 WASM 容量合计 **1455 MiB**；lagrange MSM 505/759；
   Fr FFT 16/44；FastFile 52.8。扣除 phase-1 已支付的 223 MiB 后，tauG1 段增量模型 **2200 MiB**，
   对照 M4.1 实测 **+2160 MiB**（误差 2%）。
+  → **A.1 撤回该行结论**：账目须按标量宽度拆三条；phase-1 基线 223 MiB 错（应为 72.4 MiB），
+  故「误差 2%」不成立，改后为 2351 MiB 对 2160 MiB（**高出 8.9%**）。详见下方 M5-A.1 条目。
 - **推翻/降级 M4 的候选排序**：原 H1（FFT 输入副本 `buff.slice`）在 prepared_verify@p18 约 50 MiB（≈2%），降级；
   `prepare_phase2` 相反——那里 FFT 是主路径，但模型账本（430 MiB）远小于 M3 实测（1610 MiB），
   残差指向「重复分配未及时回收」，故 M5 必须测 `arrayBuffers` 而不只是 WASM。
@@ -683,3 +686,39 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
   不跑 p20/p21。
 - **下一步**：M5-B 按 `docs/M5_PROBE_DESIGN.md` §6 实现 instrumentation-only patch（vendor 副本 + resolve hook + JSONL），
   再由 M5-C p10 smoke 验证扰动预算，M5-D 做 p16/p18 交错对照。
+---
+
+## M5-A.1｜标量宽度与 Phase 1 基线修正（2026-11-09，无实验）
+
+- **触发**：设计评审指出 A 稿把 `resLagrange` 的 32 B 标量参数套用到了全部 MSM。逐行复核后确认成立，
+  且波及 Phase 1 基线与「2% 吻合」两个结论。
+- **源码复核（三条标量路径，互不通用）**：
+  1. `powersoftau_verify.js:361` `scalars = misc.getRandomBytes(4*(n-1))` → **Phase 1 = 4 B**；
+     `:371-372` 每个 64 Ki 点分片跑两次 MSM，各 `n-1` 点（顺序 await，在途不相加）。
+  2. `:425,439` `buff_r = new Uint32Array(nPoints)` → **resTau = 4 B**（`:452` 调用）。
+  3. `:454` `bigBuffer(nPoints*Fr.n8)` 经 batchToMontgomery → fft → batchFromMontgomery → **resLagrange = 32 B**（`:482`）。
+- **Phase 1 重算（p18，4 B）**：65535 点 → `pTSizes[15]=12` → `nBitChunks=3`（原写 22）；
+  `chunkSize = floor(65535/(28/3)) = 7021` → 10 个 point-chunk（原写 2）。任务 30、单任务 0.67 MiB、在途 18.3 MiB。
+  G1 分片 `7021×96×2 = 1,348,032 < 25 页` → 不扩容；**G2（tauG2）** `7021×192×2 = 2,696,064 > 25 页` → 扩到 42 页。
+  尾部小分片（2346 点）不扩容 → **27×2.625 + 1×1.5625 = 72.4 MiB**，替代原 223 MiB。**驱动项是 G2，不是 G1。**
+- **resTau（4 B）单列**：`2^19` → bitChunk 15、3 位块、10 point-chunk、30 任务、单任务 5.4 MiB、在途 146.4 MiB、
+  165 页/Worker。它在时间上先于 resLagrange，决定 tauG1 窗口前半段形状，但不抬高最终高水位。
+- **resLagrange（32 B）不变**：`2^19` → 18 位块 × 2 point-chunk = 36 任务、单任务 41.1 MiB、在途 969.1 MiB、
+  988 页/Worker（61.75 MiB 容量）、合计 1454.6 MiB。
+- **修正后对账**：模型段增量 = 969.1 + (1454.6 − 72.4) = **2351.3 MiB**，对 M4.1 实测 +2160 MiB **高出 8.9%**；
+  同窗锚定 776 + 2351 = 3127 MiB 对实测 tauG2 标记处 2936 MiB（+6.5%）。p16 同法得 591.5 MiB 对 194 MiB（**3.0×**）。
+  → 「2% 吻合」撤回；模型身份改为**上界**，且 p16/p18 偏差量级不同，说明仍有未建模项。
+- **其他修正**：
+  - 删除「模型共存峰值 − 全程峰值」比较（不同相位不可比），改为同窗「起始 current WS + 模型增量」。
+  - F14 改正：`2^19` 的 FFT 是 **32 chunk × 16384 点**（8192 是 `2^18`）。
+  - 单位统一 MiB：`2^19×32 = 16 MiB`、`2^19×96 = 48 MiB`（原 16.8/50.3 是十进制 MB 混入）。
+  - `prepare_phase2` 的 920–1180 MiB 差额降级为**未解释残差**，不再断言「碎片/未释放」。
+  - 删除 p19–p21 外推表（模型在 p16 差 3×，外推无意义）；只保留定性风险陈述。
+  - 验收门由「模型值 70%–100%」改为三层：**L1 切分逐字段相等 / L2 逐 Worker 页数对账 / L3 同刻四量 + 显式残差**。
+- **新增两条防错要求（M5-B 必做）**：
+  1. **provenance 自证**：首条 JSONL 记录 `require.resolve('ffjavascript')` 的实际路径 + 副本 SHA-256 + patch SHA-256；
+     若指向 `node_modules` 则整次运行作废（非零退出）。
+  2. **入队绑定**：`queueAction` 入队时写 `task_id/call_id/site/send_bytes`，调度时只用该元数据，不读全局状态，
+     避免延迟调度导致 site 被下一次 MSM 覆盖。
+- **未做**：不改依赖、不改计算逻辑、不跑新测量、不跑 p20/p21；`m1-m2-frozen` 未动。
+- **下一步**：等 A.1 评审通过后进入 M5-B（vendor 副本 + resolve hook + 自证 + 入队绑定）。
