@@ -1,0 +1,59 @@
+{
+  "record": "M3-B environment",
+  "collected_at_utc": "2026-11-06T07:54:38.197Z",
+  "platform": "Windows native (Git Bash / PowerShell 5.1), NOT WSL",
+  "os": {
+    "platform": "win32",
+    "release": "10.0.26220",
+    "arch": "x64",
+    "caption": "Microsoft Windows 11 家庭版 Insider Preview 中文版",
+    "version": "10.0.26220"
+  },
+  "cpu": {
+    "model": "Intel(R) Core(TM) i7-14700",
+    "logical_cores": 28,
+    "ffjavascript_tm_concurrency": 28
+  },
+  "memory": {
+    "total_bytes": 34031325184,
+    "free_bytes_at_record": 14922948608
+  },
+  "disk": {
+    "drive": "D:",
+    "total_bytes": 262142947328,
+    "free_bytes": 180003889152,
+    "block_size": 4096
+  },
+  "runtime": {
+    "node_version": "22.22.2",
+    "node_version_string": "v22.22.2",
+    "v8": "12.4.254.21-node.39",
+    "modules": "127",
+    "snarkjs_version": "0.7.6",
+    "ffjavascript_version": "0.3.1",
+    "binfileutils_version": "0.0.12",
+    "fastfile_version": "0.0.20",
+    "powershell_version": "5.1.26100.9836"
+  },
+  "metric": {
+    "name": "Windows Peak Working Set",
+    "field": "peak_working_set_bytes",
+    "api": "System.Diagnostics.Process.PeakWorkingSet64",
+    "definition": "Peak resident working set (RAM-resident pages) of the measured node.exe process, polled while running and read once more after exit; the maximum sample is reported.",
+    "caveats": [
+      "NOT Linux Maximum RSS and NOT Private Bytes / Commit Charge.",
+      "Includes shared pages; excludes pages paged out to disk.",
+      "Working-set trimming by the OS can lower the observed value.",
+      "Worker threads share the process working set; child processes would not.",
+      "All M3 comparisons use this single metric, so the comparison is internally consistent."
+    ]
+  },
+  "method": {
+    "launcher": "node.exe launched directly (no npx/cmd shim), so the measured process IS snarkjs",
+    "cli_entry": "node_modules/snarkjs/build/cli.cjs",
+    "polling_interval_ms": 25,
+    "timing": "Stopwatch around Process.Start -> WaitForExit (wall clock, includes startup)",
+    "input_hash": "SHA-256 via Get-FileHash -Algorithm SHA256",
+    "logs": "stdout/stderr captured to results/raw/m3_logs/*.log with [t=...ms] prefixes"
+  }
+}

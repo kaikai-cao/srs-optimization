@@ -1,0 +1,307 @@
+diff --git "a/C:\\Users\\dell\\AppData\\Local\\Temp\\ffjs-orig-main.cjs" "b/D:\\Research\\srs-optimization\\vendor\\ffjavascript-0.3.1-m5\\build\\main.cjs"
+index 5bb247b..9ce3609 100644
+--- "a/C:\\Users\\dell\\AppData\\Local\\Temp\\ffjs-orig-main.cjs"
++++ "b/D:\\Research\\srs-optimization\\vendor\\ffjavascript-0.3.1-m5\\build\\main.cjs"
+@@ -1,5 +1,6 @@
+ 'use strict';
+ 
++var M5 = require('./m5_runtime.cjs');
+ var crypto = require('crypto');
+ var wasmcurves = require('wasmcurves');
+ var os = require('os');
+@@ -3129,6 +3130,8 @@ function buildBatchConvert(tm, fnName, sIn, sOut) {
+             throw new Error("Invalid buffer size");
+         }
+         const pointsPerChunk = Math.floor(nPoints/tm.concurrency);
++        const m5c = (M5 && M5.on) ? M5.plan('batch', fnName, {n_points: nPoints, s_in: sIn,
++            s_out: sOut, n_chunks: tm.concurrency}) : null;
+         const opPromises = [];
+         for (let i=0; i<tm.concurrency; i++) {
+             let n;
+@@ -3151,7 +3154,7 @@ function buildBatchConvert(tm, fnName, sIn, sOut) {
+                 {cmd: "GET", out: 0, var: 1, len:sOut * n},
+             ];
+             opPromises.push(
+-                tm.queueAction(task)
++                tm.queueAction(task, undefined, (M5 && M5.on) ? M5.sub(m5c, {chunk_idx: i, chunk_points: n}) : undefined)
+             );
+         }
+ 
+@@ -4252,6 +4255,10 @@ function thread(self) {
+     const MAXMEM = 32767;
+     let instance;
+     let memory;
++    // M5: the worker cannot require() anything (thread.toString() -> data URL),
++    // so the switch and the recorder live inline. Off => zero behaviour change.
++    const M5_ON = (typeof process !== "undefined") && process.env && process.env.M5_TRACE === "1";
++    let M5_CUR = null;
+ 
+     if (self) {
+         self.onmessage = function(e) {
+@@ -4262,6 +4269,12 @@ function thread(self) {
+                 data = e;
+             }
+ 
++            let m5ctx = null;
++            if (M5_ON && data && data.__m5ctx) {
++                m5ctx = data.__m5ctx;
++                data = data.cmds;
++            }
++
+             if (data[0].cmd == "INIT") {
+                 init(data[0]).then(function() {
+                     self.postMessage(data.result);
+@@ -4269,7 +4282,7 @@ function thread(self) {
+             } else if (data[0].cmd == "TERMINATE") {
+                 self.close();
+             } else {
+-                const res = runTask(data);
++                const res = runTask(data, m5ctx);
+                 self.postMessage(res);
+             }
+         };
+@@ -4294,10 +4307,14 @@ function thread(self) {
+         while (u32[0] & 3) u32[0]++;  // Return always aligned pointers
+         const res = u32[0];
+         u32[0] += length;
++        let m5idx = -1;
++        if (M5_CUR) m5idx = M5_CUR.allocs.push(length) - 1;
+         if (u32[0] + length > memory.buffer.byteLength) {
+             const currentPages = memory.buffer.byteLength / 0x10000;
+             let requiredPages = Math.floor((u32[0] + length) / 0x10000)+1;
+             if (requiredPages>MAXMEM) requiredPages=MAXMEM;
++            if (M5_CUR) M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
++                from_pages: currentPages, to_pages: requiredPages, top: u32[0]});
+             memory.grow(requiredPages-currentPages);
+         }
+         return res;
+@@ -4319,7 +4336,7 @@ function thread(self) {
+         u8.set(new Uint8Array(buffer), pointer);
+     }
+ 
+-    function runTask(task) {
++    function runTask(task, m5ctx) {
+         if (task[0].cmd == "INIT") {
+             return init(task[0]);
+         }
+@@ -4329,15 +4346,21 @@ function thread(self) {
+         };
+         const u32a = new Uint32Array(memory.buffer, 0, 1);
+         const oldAlloc = u32a[0];
++        const m5 = M5_ON ? { alloc_base: oldAlloc, wasm_before: memory.buffer.byteLength,
++            allocs: [], grow_events: [], allocset_bytes: 0, set_bytes: 0, get_bytes: 0,
++            cmd_count: task.length } : null;
++        M5_CUR = m5;
+         for (let i=0; i<task.length; i++) {
+             switch (task[i].cmd) {
+             case "ALLOCSET":
++                if (m5) m5.allocset_bytes += task[i].buff.byteLength;
+                 ctx.vars[task[i].var] = allocBuffer(task[i].buff);
+                 break;
+             case "ALLOC":
+                 ctx.vars[task[i].var] = alloc(task[i].len);
+                 break;
+             case "SET":
++                if (m5) m5.set_bytes += task[i].buff.byteLength;
+                 setBuffer(ctx.vars[task[i].var], task[i].buff);
+                 break;
+             case "CALL": {
+@@ -4354,6 +4377,7 @@ function thread(self) {
+                 break;
+             }
+             case "GET":
++                if (m5) m5.get_bytes += task[i].len;
+                 ctx.out[task[i].out] = getBuffer(ctx.vars[task[i].var], task[i].len).slice();
+                 break;
+             default:
+@@ -4361,8 +4385,24 @@ function thread(self) {
+             }
+         }
+         const u32b = new Uint32Array(memory.buffer, 0, 1);
+-        u32b[0] = oldAlloc;
+-        return ctx.out;
++        let m5out = null;
++        if (m5) {
++            m5.alloc_top = u32b[0];
++            u32b[0] = oldAlloc;
++            m5.wasm_after = memory.buffer.byteLength;
++            m5.out_bytes = 0;
++            for (let k=0; k<ctx.out.length; k++) m5.out_bytes += ctx.out[k].byteLength;
++            if (typeof process !== "undefined" && process.memoryUsage) {
++                const mu = process.memoryUsage();
++                m5.heap_used = mu.heapUsed; m5.external = mu.external; m5.array_buffers = mu.arrayBuffers;
++            }
++            m5.call_id = m5ctx ? m5ctx.call_id : 0;
++            m5out = { __m5: m5, out: ctx.out };
++        } else {
++            u32b[0] = oldAlloc;
++        }
++        M5_CUR = null;
++        return m5out ? m5out : ctx.out;
+     }
+ 
+ 
+@@ -4517,6 +4557,11 @@ async function buildThreadManager(wasm, singleThread) {
+                 data = e;
+             }
+ 
++            if (M5 && M5.on && data && data.__m5) {
++                const d = tm.pendingDeferreds[i];
++                data = M5.ingest(data, d && d.__m5ctx, i);
++                if (d && d.__m5ctx) M5.done(d.__m5ctx);
++            }
+             tm.working[i]=false;
+             tm.pendingDeferreds[i].resolve(data);
+             tm.processWorks();
+@@ -4542,14 +4587,22 @@ class ThreadManager {
+         this.oldPFree = 0;
+     }
+ 
+-    postAction(workerId, e, transfers, _deferred) {
++    postAction(workerId, e, transfers, _deferred, m5ctx) {
+         if (this.working[workerId]) {
+             throw new Error("Posting a job t a working worker");
+         }
+         this.working[workerId] = true;
+ 
+         this.pendingDeferreds[workerId] = _deferred ? _deferred : new Deferred();
+-        this.workers[workerId].postMessage(e, transfers);
++        if (m5ctx && M5 && M5.on) {
++            m5ctx.worker = workerId;
++            m5ctx.t_send_ms = M5.now();
++            this.pendingDeferreds[workerId].__m5ctx = m5ctx;
++            M5.emitSend(m5ctx, M5.payloadBytes(e));
++            this.workers[workerId].postMessage({ __m5ctx: M5.wire(m5ctx), cmds: e }, transfers);
++        } else {
++            this.workers[workerId].postMessage(e, transfers);
++        }
+ 
+         return this.pendingDeferreds[workerId].promise;
+     }
+@@ -4558,22 +4611,26 @@ class ThreadManager {
+         for (let i=0; (i<this.workers.length)&&(this.actionQueue.length > 0); i++) {
+             if (this.working[i] == false) {
+                 const work = this.actionQueue.shift();
+-                this.postAction(i, work.data, work.transfers, work.deferred);
++                this.postAction(i, work.data, work.transfers, work.deferred, work.m5ctx);
+             }
+         }
+     }
+ 
+-    queueAction(actionData, transfers) {
++    queueAction(actionData, transfers, m5ctx) {
+         const d = new Deferred();
+ 
+         if (this.singleThread) {
+             const res = this.taskManager(actionData);
+             d.resolve(res);
+         } else {
++            if (M5 && M5.on) {
++                m5ctx = M5.bind(m5ctx || M5.unlabeled());
++            }
+             this.actionQueue.push({
+                 data: actionData,
+                 transfers: transfers,
+-                deferred: d
++                deferred: d,
++                m5ctx: m5ctx
+             });
+             this.processWorks();
+         }
+@@ -4873,7 +4930,7 @@ const pTSizes = [
+ function buildMultiexp(curve, groupName) {
+     const G = curve[groupName];
+     const tm = G.tm;
+-    async function _multiExpChunk(buffBases, buffScalars, inType, logger, logText) {
++    async function _multiExpChunk(buffBases, buffScalars, inType, logger, logText, m5c) {
+         if ( ! (buffBases instanceof Uint8Array) ) {
+             if (logger) logger.error(`${logText} _multiExpChunk buffBases is not Uint8Array`);
+             throw new Error(`${logText} _multiExpChunk buffBases is not Uint8Array`);
+@@ -4934,7 +4991,7 @@ function buildMultiexp(curve, groupName) {
+                 {cmd: "GET", out: 0, var: 2, len: G.F.n8*3}
+             ];
+             opPromises.push(
+-                G.tm.queueAction(task)
++                G.tm.queueAction(task, undefined, (M5 && M5.on) ? M5.sub(m5c, {bc_idx: i}) : undefined)
+             );
+         }
+ 
+@@ -4987,13 +5044,17 @@ function buildMultiexp(curve, groupName) {
+         if (chunkSize>MAX_CHUNK_SIZE) chunkSize = MAX_CHUNK_SIZE;
+         if (chunkSize<MIN_CHUNK_SIZE) chunkSize = MIN_CHUNK_SIZE;
+ 
++        const m5c = (M5 && M5.on) ? M5.plan('msm', logText || 'msm', {group: groupName,
++            n_points: nPoints, s_scalar: sScalar, bit_chunk: bitChunkSize, n_bit: nChunks,
++            chunk_size: chunkSize, n_point_chunk: Math.ceil(nPoints / chunkSize)}) : null;
+         const opPromises = [];
+         for (let i=0; i<nPoints; i += chunkSize) {
+             if (logger) logger.debug(`Multiexp start: ${logText}: ${i}/${nPoints}`);
+             const n= Math.min(nPoints - i, chunkSize);
+             const buffBasesChunk = buffBases.slice(i*sGIn, (i+n)*sGIn);
+             const buffScalarsChunk = buffScalars.slice(i*sScalar, (i+n)*sScalar);
+-            opPromises.push(_multiExpChunk(buffBasesChunk, buffScalarsChunk, inType, logger, logText).then( (r) => {
++            const m5sub = (M5 && M5.on) ? M5.sub(m5c, {pc_idx: i / chunkSize, points: n}) : undefined;
++            opPromises.push(_multiExpChunk(buffBasesChunk, buffScalarsChunk, inType, logger, logText, m5sub).then( (r) => {
+                 if (logger) logger.debug(`Multiexp end: ${logText}: ${i}/${nPoints}`);
+                 return r;
+             }));
+@@ -5131,6 +5192,9 @@ function buildFFT(curve, groupName) {
+ 
+         const l2Chunk = log2(pointsInChunk);
+ 
++        const m5c = (M5 && M5.on) ? M5.plan('fft', loggerTxt || 'fft', {n_points: nPoints,
++            bits: bits, points_in_chunk: pointsInChunk, n_chunks: nChunks,
++            inverse: !!inverse}) : null;
+         const promises = [];
+         for (let i = 0; i< nChunks; i++) {
+             if (logger) logger.debug(`${loggerTxt}: fft ${bits} mix start: ${i}/${nChunks}`);
+@@ -5161,7 +5225,7 @@ function buildFFT(curve, groupName) {
+             } else {
+                 task.push({cmd: "GET", out:0, var: 0, len: sMid*pointsInChunk});
+             }
+-            promises.push(tm.queueAction(task).then( (r) => {
++            promises.push(tm.queueAction(task, undefined, (M5 && M5.on) ? M5.sub(m5c, {phase: 'mix', chunk_idx: i, chunk_points: pointsInChunk}) : undefined).then( (r) => {
+                 if (logger) logger.debug(`${loggerTxt}: fft ${bits} mix end: ${i}/${nChunks}`);
+                 return r;
+             }));
+@@ -5218,7 +5282,7 @@ function buildFFT(curve, groupName) {
+                         task.push({cmd: "GET", out: 0, var: 0, len: pointsInChunk*sMid});
+                         task.push({cmd: "GET", out: 1, var: 1, len: pointsInChunk*sMid});
+                     }
+-                    opPromises.push(tm.queueAction(task).then( (r) => {
++                    opPromises.push(tm.queueAction(task, undefined, (M5 && M5.on) ? M5.sub(m5c, {phase: 'join', level: i, group_idx: j, pair_idx: k, chunk_points: pointsInChunk}) : undefined).then( (r) => {
+                         if (logger) logger.debug(`${loggerTxt}: fft ${bits} join  ${i}/${bits}  ${j+1}/${nGroups} ${k}/${nChunksPerGroup/2}`);
+                         return r;
+                     }));
+@@ -5259,6 +5323,13 @@ function buildFFT(curve, groupName) {
+             }
+         }
+ 
++        if (M5 && M5.on) {
++            let chunksBytes = 0;
++            for (let i=0; i<nChunks; i++) chunksBytes += (chunks[i] ? chunks[i].byteLength : 0);
++            M5.emit({ev: 'fft_assembly', call_id: m5c ? m5c.call_id : null, site: loggerTxt || 'fft',
++                n_points: nPoints, s_in: sIn, s_mid: sMid, s_out: sOut,
++                copy_bytes: nPoints * sIn, chunks_bytes: chunksBytes, out_bytes: buffOut.byteLength});
++        }
+         if (returnArray) {
+             return buffer2array(buffOut, sOut);
+         } else {
+@@ -5381,6 +5452,8 @@ function buildFFT(curve, groupName) {
+         if (chunkSize > MAX_CHUNK_SIZE) chunkSize = MAX_CHUNK_SIZE;
+ 
+         const opPromises = [];
++        const m5c = (M5 && M5.on) ? M5.plan('fftjoinext', loggerTxt || 'fftJoinExt', {n_points: nPoints,
++            s_in: sIn, s_mid: sMid, s_out: sOut, chunk_size: chunkSize, fn: fn}) : null;
+ 
+         for (let i=0; i<nPoints; i += chunkSize) {
+             if (logger) logger.debug(`${loggerTxt}: fftJoinExt Start: ${i}/${nPoints}`);
+@@ -5417,7 +5490,7 @@ function buildFFT(curve, groupName) {
+             task.push({cmd: "GET", out: 0, var: 0, len: n*sOut});
+             task.push({cmd: "GET", out: 1, var: 1, len: n*sOut});
+             opPromises.push(
+-                tm.queueAction(task).then( (r) => {
++                tm.queueAction(task, undefined, (M5 && M5.on) ? M5.sub(m5c, {chunk_idx: i / chunkSize, chunk_points: n}) : undefined).then( (r) => {
+                     if (logger) logger.debug(`${loggerTxt}: fftJoinExt End: ${i}/${nPoints}`);
+                     return r;
+                 })

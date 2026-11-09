@@ -756,3 +756,120 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
      **无 MSM、无 Worker、无 WASM 分配**，上界 < 1 KiB，判为 0（原写"疑似 < 1 MiB"）。
 - **未做**：不改依赖、不改计算逻辑、不跑新测量、不跑 p20/p21；`m1-m2-frozen` 未动。
 - **下一步**：等 A.2 评审通过即进入 M5-B。**A.2 是本项目最后一次静态设计校准**，此后所有数字来自探针或明确标注为边界假设。
+
+---
+
+## M5-B｜探针建成：vendor 副本 + 24 处补丁 + 三模式驱动（2026-11-09）
+
+- **触发**：M5-A.2 评审通过，但要求"M5-C 之前 L1/L2 必须真正可执行，而不是只写在文档里"。
+  本轮只做**测量工具**：不碰算法、不跑 p16/p18、不改 `node_modules`。
+- **形态**：不修改 `node_modules`。`scripts/m5_build_vendor.cjs` 把 `node_modules/ffjavascript` 整包复制到
+  `vendor/ffjavascript-0.3.1-m5/`，在副本的 `build/main.cjs`（`exports["."].node.require` 指向的唯一入口，
+  Worker 源码由 `thread.toString()` 从同一 bundle 生成）上打 **24 处断言式补丁**：每处先断言锚点唯一命中，
+  否则构建失败退出。产出 `M5_MANIFEST.json`（before / after / runtime / patch 四个 sha256）与
+  `patches/m5-instrumentation.patch`（14,097 B）。
+  - `build/main.cjs`：`40128293…` → `efd3ed81d15596c517e12eb09ce1530b6a08270d74501e4d2af689d0d0ddb5db`；
+    `build/m5_runtime.cjs`：`fa6960a8…`。
+- **开关与自证**：`scripts/m5_hook.cjs` 作 `--require` 钩子，用 `Module._resolveFilename` 把 `ffjavascript`
+  重定向到 vendor；`M5_CONFIG` 未设时**完全不动解析**（pristine 路径）。自证硬门：
+  `require.resolve('ffjavascript')` 必须等于 vendor 路径且不含 `node_modules`，否则 `process.exit(3)`；
+  每次运行首条 JSONL 写入 `resolved + sha256 + trace=ON/OFF`。
+  - **Worker 线程会继承 `process.execArgv`**（含 `--require`），所以钩子开头必须
+    `if (require('worker_threads').isMainThread === false) return;`，否则每个 Worker 都打开同一个 JSONL，
+    实测刷出 100+ 行重复 `[m5] resolved=`。
+- **上下文绑定**（评审缺口 ③）：不再依赖"读全局"。`queueAction(actionData, transfers, ctx)` 在**入队时**
+  分配 `task_id` 并绑定 `ctx`；`_multiExp` / `_multiExpChunk` / `batchConvert` / `_fft` / `*Join*` /
+  `batchLEMtoU` 各自在调用点构造 `ctx`（`call_id / site / kind / group / n_points / ...`），
+  `ctx === undefined` 时记 `site:'unlabeled'`——**记录而非丢弃**。MSM / BatchConvert / FFT 各发独立
+  `*_plan` 事件，与 `task_send` / `worker_task` 用 `call_id` 对齐。
+- **事件模型**：`provenance` / `anchor` / `task_send` / `worker_task` / `task_done` / `msm_plan` /
+  `batch_plan` / `fft_plan` / `fft_assembly` / `summary`。`worker_task` 带 `allocs[]`（长度 ≤ 6）与
+  `grow_events[]`（`at_alloc / len / from_pages / to_pages / top`），供 L2 无容差回放。
+- **门槛脚本（可执行，不是文档）**：
+  - `scripts/m5_check_l1.cjs`：按顺序逐调用比 `kind` 与 `n_points / s_scalar / s_in / s_out / bit_chunk /
+    n_bit / chunk_size / points_in_chunk / n_chunks`，并用 `task_send` 计数比 `n_tasks`；
+    缺 `provenance` 行则拒绝评分。
+  - `scripts/m5_check_l2.cjs`：从 `alloc_base` 起按 `allocs[]` 回放，逐条比 `grow_events[]` 与 `wasm_after`，
+    并校验 `alloc_top`；**零容差**，首个不符定位到 `(worker, task_id, alloc_index)`。
+- **三模式驱动**：`scripts/measure_m5.ps1 -Mode pristine|vendor|trace`，委托 `measure_snarkjs.ps1`，
+  从而 Windows 口径与 M4.1 完全一致。`pristine` = M4.1 基线；`vendor` = 加载补丁但 `M5_TRACE=0`（测扰动）；
+  `trace` = 出 JSONL。这三者是 M5-C 扰动预算的对照基础。
+- **静态账本重写**（评审缺口 ①②）：`scripts/m5_budget.cjs` 从"每次调用独立估算 + 排序取最坏"改为
+  **顺序逐 Worker 容量池模型**（`newPool / replayOn / dispatchTasks / buildPlan`）；`--operation plan`
+  输出 445 次调用（p18）的完整执行计划，G1 / G2 与所有实际执行的 power 全覆盖。`phase1` 与
+  `prepared_verify` 两个子命令改为**从同一 plan 取数**，删除了旧的 `phase1Ledger` / `verifyPowerLedger`
+  ——它们是"每 section 独立估算"的来源，会与 plan 给出互相矛盾的数字（同一份文档里出现两套页数）。
+- **本轮踩到并修掉的 6 个实现缺陷**（均为"看起来对"的错，记录以备复查）：
+  1. `/tmp` 在 Windows 上不可 `require` → 计划文件改写到 `results/raw/_m5_plan_*.json`。
+  2. `RUNTIME_SRC` 模板字符串里的反引号提前闭合 → 改用括号。
+  3. 补丁锚点不唯一（`tm.queueAction(task)` 后接 `await Promise.all` 的片段出现 2 次）→ 扩大锚点至含唯一前缀。
+  4. `M5.ingest` 收到的是 snapshot，而函数内部又取 `snap.out` → p10 冒烟在 `pairingEq` 读 `undefined`；
+     改为传入整条消息、内部取 `payload.out`。
+  5. Worker 重复打开 JSONL（见上）。
+  6. **任务数不符**：L1 首次 FAIL 在 `#67 msm tauG1.p11.resTau: tasks expected 8, observed 10`。
+     根因是 `_multiExpChunk` 在 `engine_multiexp.js:53-54` **按分片点数重算** `bitChunkSize`，与 `_multiExp`
+     外层值不同（2048 点被 `MIN_CHUNK_SIZE` 切成 2×1024，内层 `pTSizes[10]=7` → 5 个位块）。
+     计算器改为按每个 `chunkPts` 单独算位块数，连带修正 p18 的 tauG1 任务数 36→39、tauG2 38→40、
+     首轮分布 18/10→19/9 与 19/9→20/8、tauG2 池增量 92.75→96.1 MiB。
+- **未做**：不跑 p16/p18 的 trace（留给 M5-D）；不写优化代码；`m1-m2-frozen` 未动。
+
+---
+
+## M5-C｜p10 冒烟：L1 / L2 双 PASS，`alloc_base` 实测 102,328 B（2026-11-09）
+
+- **命令**：`measure_m5.ps1 -Mode trace -Power 10` → `snarkjs powersoftau verify` 的 `prepared_verify @ 2^10`，
+  exit 0、**2,082 ms**、**30,537 条事件**。
+- **事件构成**：`provenance 1 / anchor 1 / task_send 10,084 / worker_task 10,084 / task_done 10,084 /
+  batch_plan 94 / msm_plan 98 / fft_plan 45 / fft_assembly 45 / summary 1`；
+  `provenance` 自证指向 `vendor/ffjavascript-0.3.1-m5`，未回落到 `node_modules`。
+- **L1 PASS**：237/237 次调用按顺序全部匹配（`kind` + 9 个字段），`task_send` 计数与计划一致；
+  其中 24 个任务为 `unlabeled`（占 10,084 的 0.24%）。
+- **L2 PASS（零容差）**：28 个 Worker、10,084 个任务，从 `alloc_base` 起逐条回放，`grow_events[]` 与
+  `wasm_after` **全部一致，0 fails**；p10 全程 `maxpages = 25`（phase 1 的 G1 分片远小于 25 页，不扩容）。
+  这也顺带证实账目 D：94 次 batchconvert 调用在 p10 上 0 次 grow。
+- **HYP-1 被推翻**：10,084 个任务的 `alloc_base` **全部 = 102,328 B**，不是 0。用该基址重算：
+
+  | 量 | 基址 0（A.2 的假设） | 基址 102,328 B（实测） |
+  | --- | ---: | ---: |
+  | phase-1 池（p18） | 1,176 页 = 73.5 MiB | **1,204 页 = 75.3 MiB**（28 × 43） |
+  | `resLagrange@p19` 首轮 | 27×988 + 1×549 | **19×989 + 9×551** |
+  | `tauG2 resLagrange@p18` 池增量 | 1,539 页 = 96.2 MiB | **1,538 页 = 96.1 MiB** |
+  | batchconvert 冷启动 `@2^19` | 28 页 | **30 页 = 52.5 MiB** |
+
+  幅度都是整页级，方向与 A.2 的判断一致（基址只抬高 `requiredPages`），但**页数本身就是 L2 的判据**，
+  所以必须在模型里显式存在。`docs/M5_PROBE_DESIGN.md` 的 §1、§5.1–§5.6、§5.8 已按实测基址全部重算，
+  §5.6 的模型段增量随之从 2351.3 / 591.5 MiB 改为 **2,396.5 / 594.2 MiB**（对实测均值 0.99× / 2.79×）。
+- **`unlabeled` 24 个任务的定性**：签名均为 `allocs = [144, 288, 288, 20,448, 576]`，即 3 点 G1 MSM
+  （`timesScalar` 路径），来自 snarkjs 在主线程内联构造的 task（`cli.cjs:3555+`），不经过任何 `queueAction`
+  调用点，因此没有 `site`。属"必须记录而非丢弃"的正常类别，L1 只校验其存在与可回放，不计入逐调用比对。
+- **曲线只有一个 ThreadManager**：`engine.js:14` 只调一次 `buildThreadManager`，G1 / G2 / Fr 共用 `curve.tm`，
+  按 worker 号聚合不会串池——这是 L2 能逐 Worker 对账的前提。
+- **未做**：p16 / p18 的 trace 尚未跑。
+- **下一步**：M5-D 在 p16 / p18 上做 pristine-vs-trace 交错对照。
+
+---
+
+## M5-C.1｜扰动预算：三模式各 5 次（2026-11-09）
+
+- **目的**：在跑 p16/p18 之前先回答"探针本身会不会改变被测对象"。产物在 `results/raw/m5c/`。
+- **命令**：同一 fixture、同一命令行，只改 `-Mode`（`pristine` / `vendor` / `trace`），各 `-Repeats 5`。
+
+  | 模式 | peak WS（MiB） | 中位 | 耗时中位 (ms) |
+  | --- | --- | ---: | ---: |
+  | pristine | 613.5 / 554.4 / 555.1 / 556.9 / 613.1 | 557 | 1,885 |
+  | vendor | 626.4 / 625.1 / 589.4 / 589.3 / 565.7 | 589 | 1,913 |
+  | trace | 622.6 / 565.2 / 628.3 / 595.4 / 570.5 | 595 | 2,067 |
+
+- **结论 1（可主张）**：换 bundle 免费。`pristine` 与 `vendor` 的耗时中位差 28 ms（1.5%）。
+- **结论 2（可主张）**：写 JSONL 约 **+9%** 墙钟（trace 五次全部 ≥ 1,940 ms，其余两组 4/5 ≤ 1,974 ms）。
+  任何 trace-vs-pristine 的时间比较都必须先扣掉这个系统性偏差。
+- **结论 3（必须是负结论）**：**peak WS 无法判定扰动**。三种模式区间几乎完全重合（554–628 MiB），
+  而同一模式内的极差已有 59–63 MiB（`pristine` 自身出现 555 与 613 两个簇）。
+  模式之间的差 < 模式之内的差 ⇒ **p16/p18 的归因不得以 peak WS 为主判据**，主判据只能是逐 Worker 的
+  `allocs / grow_events / wasm_after`。这也回溯说明 M4.1 把三次读数的极差称为"±10% 噪声"是过强表述。
+- **可复现性**：五次 trace 的 L1（237/237 调用）与 L2（10,084 任务、0 fails）全部 PASS，
+  说明探针输出本身稳定，peak WS 的离散来自被测进程。
+- **顺手修掉的一个统计 bug**：`measure_m5.ps1` 用
+  `Get-Content -ReadCount 0 | Measure-Object -Line` 数事件行数，`-ReadCount 0` 返回**单个数组对象**，
+  于是 30,537 行的 JSONL 被报成 `events: 1`（清单里的数字对、文件本身没错）。改为在文件句柄上
+  逐行 `ReadLine()` 计数后，清单显示 30,537。

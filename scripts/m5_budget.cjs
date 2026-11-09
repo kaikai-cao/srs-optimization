@@ -171,78 +171,59 @@ function msmCall(nPoints, sG, sScalar, concurrency, jacBytes) {
   };
 }
 
-/** phase 1: the four processSection() calls before phase 2 begins */
-function phase1Ledger(power, concurrency) {
-  const sections = [
-    { name: 'tauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power * 2 - 1 },
-    { name: 'tauG2', group: 'G2', sG: S.G2aff, jac: S.G2jac, nPoints: 2 ** power },
-    { name: 'alphatauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power },
-    { name: 'betatauG1', group: 'G1', sG: S.G1aff, jac: S.G1jac, nPoints: 2 ** power },
-  ];
+/** phase 1: the four processSection() calls before phase 2 begins
+ *
+ * NOTE (M5-B): this ledger used to size each section in isolation with the OUTER
+ * bit-chunk count, which produced task counts that the probe does not reproduce
+ * (_multiExpChunk recomputes bitChunkSize from the chunk size -- see msmTasks).
+ * The per-section numbers now come from the sequential plan (phase1RowsFromPlan);
+ * verifyPowerLedger is likewise replaced by powerRowsFromPlan so that G2 and every
+ * power actually executed are covered, not just the largest G1 tier.
+ */
 
-  const rows = sections.map((sec) => {
-    // MAX_CHUNK_SIZE = 65536 points per read; each chunk runs TWO MSMs on n-1
-    const chunkPts = [];
-    for (let i = 0; i < sec.nPoints; i += PHASE1_CHUNK) {
-      chunkPts.push(Math.min(sec.nPoints - i, PHASE1_CHUNK));
-    }
-    const worst = msmCall(
-      Math.max(...chunkPts) - 1,
-      sec.sG,
-      SCALAR_4B,
-      concurrency,
-      sec.jac
-    );
-    const small = msmCall(
-      Math.min(...chunkPts) - 1,
-      sec.sG,
-      SCALAR_4B,
-      concurrency,
-      sec.jac
-    );
+/** Per-section phase-1 rows taken from the sequential plan (single source of truth). */
+function phase1RowsFromPlan(plan) {
+  const names = [];
+  for (const c of plan.calls) {
+    if (!c.site.startsWith('phase1.')) continue;
+    const name = c.site.split('.')[1];
+    if (!names.includes(name)) names.push(name);
+  }
+  return names.map((name) => {
+    const batch = callsMatching(plan, `phase1.${name}.batchLEMtoU`);
+    const msms = callsMatching(plan, `phase1.${name}.bases0`);
+    const exit = lastCall(plan, `phase1.${name}.`);
+    const worst = msms.reduce((a, b) => (b.perTaskSendMax > a.perTaskSendMax ? b : a));
+    const nPerChunk = msms.length ? msms[0].taskCount : 0;
     return {
-      ...sec,
-      chunkPts,
-      nChunks: chunkPts.length,
-      msmPoints: Math.max(...chunkPts) - 1,
-      worst,
-      small,
+      name,
+      group: worst.group,
+      nPoints: batch.reduce((a, b) => a + b.nPoints, 0),
+      nChunks: batch.length,
+      msmPoints: worst.nPoints,
+      chunkPts: worst.chunkPts,
+      bitChunkSize: worst.bitChunk,
+      innerBitChunks: worst.chunkPts ? worst.chunkPts.map((p) => PTSIZES[log2floor(p)]) : [],
+      nBitChunks: worst.nBit,
+      nPointChunks: worst.chunkPts ? worst.chunkPts.length : 0,
+      taskCount: nPerChunk,
+      perTaskSendMax: worst.perTaskSendMax,
+      wave1SendBytes: worst.wave1SendBytes,
+      maxWorkerPages: Math.max(...exit.workerPagesAfter),
+      sectionPoolPages: exit.poolPagesAfter,
+      grewWorkersInRun: exit.grewWorkers,
     };
   });
-
-  // A worker's linear memory is a high-water mark; the worst task in phase 1
-  // decides every worker that ever ran a full-size chunk.
-  const driver = rows.reduce((a, b) => (b.worst.maxWorkerMemBytes > a.worst.maxWorkerMemBytes ? b : a));
-  const grownPages = driver.worst.maxWorkerPages;
-  const grownBytes = driver.worst.maxWorkerMemBytes;
-  const nGrownTasks = driver.worst.taskCount;
-
-  // Point-chunks: full-size ones grow a worker, the tail one does not.
-  const fullChunks = Math.max(1, driver.worst.nPointChunks - 1);
-  const grownWorkers = Math.min(concurrency, fullChunks * driver.worst.nBitChunks);
-  const initBytes = MEM_SIZE_PAGES * PAGE_BYTES;
-  const baseline = grownWorkers * grownBytes + (concurrency - grownWorkers) * initBytes;
-
-  return {
-    kind: 'phase1',
-    rows,
-    driver: driver.name,
-    grownPages,
-    grownBytesPerWorker: grownBytes,
-    grownWorkers,
-    initPerWorkerBytes: initBytes,
-    baselineBytes: baseline,
-    baselineMiB: MiB(baseline),
-    note: 'scalars are 4 B (getRandomBytes(4*(n-1))); two MSMs per 64 Ki-point chunk',
-  };
 }
 
-/** phase 2: verifyPower(p) runs resTau (4 B) and then resLagrange (32 B) */
-function verifyPowerLedger(p, concurrency) {
-  const nPoints = 2 ** p;
-  const tau = msmCall(nPoints, S.G1aff, SCALAR_4B, concurrency, S.G1jac);
-  const lag = msmCall(nPoints, S.G1aff, SCALAR_FR, concurrency, S.G1jac);
-  return { kind: 'verifyPower', p, nPoints, resTau: tau, resLagrange: lag };
+/** Per-power rows of one phase-2 section from the plan (G1 or G2, every power). */
+function powerRowsFromPlan(plan, sectionName, phase) {
+  const rows = [];
+  for (const c of plan.calls) {
+    const m = c.site.match(new RegExp(`^${sectionName}\\.p(\\d+)\\.${phase}$`));
+    if (m) rows.push(Object.assign({ power: Number(m[1]) }, c));
+  }
+  return rows;
 }
 
 /** engine_fft.js _fft (mix + join), single non-extended transform */
@@ -396,8 +377,8 @@ function batchConvertLedger(nPoints, concurrency, sIn, sOut) {
 // ANY worker and the pool total is independent of the dispatch order.
 // ---------------------------------------------------------------------------
 
-function newPool(concurrency) {
-  return { concurrency, pages: new Array(concurrency).fill(MEM_SIZE_PAGES) };
+function newPool(concurrency, baseBytes = 0) {
+  return { concurrency, base: baseBytes, pages: new Array(concurrency).fill(MEM_SIZE_PAGES) };
 }
 
 function poolPages(pool) {
@@ -409,8 +390,8 @@ function poolMiB(pool) {
 }
 
 /** Replay one task on one worker. Returns the grow events actually taken. */
-function replayOn(pool, worker, allocs, baseBytes = 0) {
-  let top = baseBytes;
+function replayOn(pool, worker, allocs, baseBytes) {
+  let top = baseBytes === undefined ? pool.base || 0 : baseBytes;
   let pages = pool.pages[worker];
   const events = [];
   for (let i = 0; i < allocs.length; i++) {
@@ -428,8 +409,8 @@ function replayOn(pool, worker, allocs, baseBytes = 0) {
 }
 
 /** Pages a task needs on a pristine 25-page worker (alloc_base = 0). */
-function pagesAtInit(allocs) {
-  const probe = { concurrency: 1, pages: [MEM_SIZE_PAGES] };
+function pagesAtInit(allocs, baseBytes = 0) {
+  const probe = { concurrency: 1, base: baseBytes, pages: [MEM_SIZE_PAGES] };
   replayOn(probe, 0, allocs);
   return probe.pages[0];
 }
@@ -450,7 +431,7 @@ function dispatchTasks(pool, tasks) {
   let lateProvablyFree = true;
   const minAfterFirst = Math.min(...pool.pages);
   for (let i = C; i < tasks.length; i++) {
-    const need = pagesAtInit(tasks[i].allocs);
+    const need = pagesAtInit(tasks[i].allocs, pool.base || 0);
     if (need > lateMaxNeed) lateMaxNeed = need;
     if (need > minAfterFirst) lateProvablyFree = false;
   }
@@ -464,7 +445,7 @@ function dispatchTasks(pool, tasks) {
     lateProvablyFree,
     deltaPages: delta.reduce((a, b) => a + b, 0),
     grewWorkers: delta.filter((d) => d > 0).length,
-    wave1Pages: tasks.slice(0, C).map((t) => pagesAtInit(t.allocs)),
+    wave1Pages: tasks.slice(0, C).map((t) => pagesAtInit(t.allocs, pool.base || 0)),
     workerPages: pool.pages.slice(),
   };
 }
@@ -479,12 +460,21 @@ function msmTasks(nPoints, sG, sScalar, jacBytes, concurrency) {
   const chunkPts = [];
   for (let i = 0; i < nPoints; i += chunkSize) chunkPts.push(Math.min(nPoints - i, chunkSize));
 
+  // engine_multiexp.js:53-54 recomputes bitChunkSize INSIDE _multiExpChunk from
+  // the CHUNK size, not from the whole buffer. The two differ whenever the
+  // chunk size crosses a power of two (e.g. 2^11 points clamped to 2 x 2^10:
+  // outer pTSizes[11]=8 -> 4 bit-chunks, inner pTSizes[10]=7 -> 5 bit-chunks).
+  // The task count follows the INNER value; only `chunkSize` uses the outer one.
+  const nBitByChunk = [];
   const tasks = [];
   for (const pts of chunkPts) {
+    const bc = PTSIZES[log2floor(pts)];
+    const nb = Math.floor((sScalar * 8 - 1) / bc) + 1;
+    nBitByChunk.push({ points: pts, bit_chunk: bc, n_bit: nb });
     const allocs = [pts * sG, pts * sScalar, jacBytes];
-    for (let b = 0; b < nBitChunks; b++) tasks.push({ pts, allocs });
+    for (let b = 0; b < nb; b++) tasks.push({ pts, allocs });
   }
-  return { bitChunkSize, nBitChunks, chunkSize, chunkPts, tasks };
+  return { bitChunkSize, nBitChunks, chunkSize, chunkPts, nBitByChunk, tasks };
 }
 
 function batchTasks(nPoints, concurrency, sIn, sOut) {
@@ -515,9 +505,14 @@ function fftTasks(nPoints, concurrency, sMid) {
 function emit(pool, call) {
   const beforePages = poolPages(pool);
   const workerPagesBefore = pool.pages.slice();
+  // Worker-side payload of one task = sum of its WASM allocs (bases + scalars + out).
+  const send = call.tasks.map((t) => t.allocs.reduce((a, b) => a + b, 0));
+  const wave1 = send.slice(0, pool.concurrency);
   const d = dispatchTasks(pool, call.tasks);
   return Object.assign({}, call, {
     taskCount: call.tasks.length,
+    perTaskSendMax: send.length ? Math.max(...send) : 0,
+    wave1SendBytes: wave1.reduce((a, b) => a + b, 0),
     wave1Pages: d.wave1Pages,
     lateTasks: d.lateTasks,
     lateMaxNeedAtInit: d.lateMaxNeedAtInit,
@@ -531,6 +526,17 @@ function emit(pool, call) {
     poolMiBAfter: f1(poolMiB(pool)),
     tasks: undefined,
   });
+}
+
+/** All emitted calls whose site starts with `prefix`, in execution order. */
+function callsMatching(plan, prefix) {
+  return plan.calls.filter((c) => c.site.startsWith(prefix));
+}
+
+/** Last call of a section group -- its pool snapshot is the section's exit state. */
+function lastCall(plan, prefix) {
+  const m = callsMatching(plan, prefix);
+  return m.length ? m[m.length - 1] : null;
 }
 
 function phase1Sections(power) {
@@ -554,8 +560,8 @@ const PHASE2_SECTIONS = (power) => [
  * order the code executes it. This is the L1 oracle: every field except the pool
  * columns must match the probe byte for byte.
  */
-function buildPlan(power, concurrency) {
-  const pool = newPool(concurrency);
+function buildPlan(power, concurrency, baseBytes = 0) {
+  const pool = newPool(concurrency, baseBytes);
   const calls = [];
 
   // ---- phase 1: processSection, 4 B scalars, two MSMs per 64 Ki chunk --------
@@ -625,15 +631,15 @@ function buildPlan(power, concurrency) {
 }
 
 /** Pages a single call leaves on the pool, without touching a shared pool. */
-function callInIsolation(call, concurrency) {
-  const pool = newPool(concurrency);
+function callInIsolation(call, concurrency, baseBytes = 0) {
+  const pool = newPool(concurrency, baseBytes);
   dispatchTasks(pool, call.tasks);
   return { poolPages: poolPages(pool), poolMiB: f1(poolMiB(pool)) };
 }
 
 // ---- reporting -------------------------------------------------------------
-function printPool(power, concurrency) {
-  const plan = buildPlan(power, concurrency);
+function printPool(power, concurrency, baseBytes) {
+  const plan = buildPlan(power, concurrency, baseBytes);
   console.log(`### per-worker capacity pool @ power ${power} (C=${concurrency})\n`);
   console.log('| site | kind | pts | tasks | wave1 pages (min..max) | late | delta pages | delta MiB | grew | pool MiB |');
   console.log('| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |');
@@ -650,8 +656,8 @@ function printPool(power, concurrency) {
   return plan;
 }
 
-function printSegments(power, concurrency) {
-  const plan = buildPlan(power, concurrency);
+function printSegments(power, concurrency, baseBytes) {
+  const plan = buildPlan(power, concurrency, baseBytes);
   const find = (site) => plan.calls.find((c) => c.site === site);
   const last = (suffix) => [...plan.calls].reverse().find((c) => c.site.endsWith(suffix));
   const tauG1Start = find('tauG1.p0.resTau');
@@ -678,73 +684,91 @@ function printSegments(power, concurrency) {
   return plan;
 }
 
-function printPreparedVerify(power, concurrency) {
-  const p1 = phase1Ledger(power, concurrency);
-  const big = verifyPowerLedger(power + 1, concurrency);
-  const mid = verifyPowerLedger(power, concurrency);
+function printPreparedVerify(power, concurrency, baseBytes = 0) {
+  const plan = buildPlan(power, concurrency, baseBytes);
+  const p1rows = phase1RowsFromPlan(plan);
   const fft = fftLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr, S.Fr);
-  const bcBig = batchConvertLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr);
-  const bcMid = batchConvertLedger(2 ** power, concurrency, S.Fr, S.Fr);
+  const b = (n) => baseBytes; // readability alias for the cold-start replay
+  void b;
 
-  console.log(`### prepared_verify @ power ${power} (concurrency ${concurrency})\n`);
+  console.log(`### prepared_verify @ power ${power} (concurrency ${concurrency}, alloc base ${baseBytes} B)\n`);
   console.log('#### A. phase 1 -- processSection, 4 B scalars (powersoftau_verify.js:361)\n');
-  console.log('| section | group | points | 64 Ki-chunks | MSM points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages | workers grown |');
-  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  for (const r of p1.rows) {
+  console.log('| section | group | points | 64 Ki-chunks | MSM points | outer bitChunk | inner bit-chunks | point-chunks | tasks per 64 Ki | per-task (MiB) | in-flight (MiB) | worker pages (max) | pool after (pages) |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of p1rows) {
     console.log(
-      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.worst.bitChunkSize} | ${r.worst.nBitChunks} | ${r.worst.nPointChunks} | ${r.worst.taskCount} | ${f1(MiB(r.worst.perTaskSendMax))} | ${f1(MiB(r.worst.wave1SendBytes))} | ${r.worst.maxWorkerPages} | ${r.worst.noGrow ? 0 : Math.min(concurrency, (r.worst.nPointChunks - 1) * r.worst.nBitChunks)} |`
+      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.bitChunkSize} | ${r.innerBitChunks.join('/')} | ${r.nPointChunks} | ${r.taskCount} | ${f1(MiB(r.perTaskSendMax))} | ${f1(MiB(r.wave1SendBytes))} | ${r.maxWorkerPages} | ${r.sectionPoolPages} |`
     );
   }
+  const pool1 = plan.poolAtPhase2;
   console.log(
-    `\nphase-1 baseline (driver: ${p1.driver}): ${p1.grownWorkers} workers x ${p1.grownPages} pages (${f2(MiB(p1.grownBytesPerWorker))} MiB) + rest at 25 pages = **${f1(p1.baselineMiB)} MiB**\n`
+    `\nphase-1 exit pool = ${pool1} pages = **${f1(MiB(pool1 * PAGE_BYTES))} MiB** (sequential high-water model, base ${baseBytes} B)\n`
   );
 
-  console.log('#### B. phase 2 -- resTau, 4 B scalars (powersoftau_verify.js:425,452)\n');
-  console.log('| p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages |');
-  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  console.log(
-    `| ${big.p} | ${big.nPoints} | ${big.resTau.bitChunkSize} | ${big.resTau.nBitChunks} | ${big.resTau.nPointChunks} | ${big.resTau.taskCount} | ${f1(MiB(big.resTau.perTaskSendMax))} | ${f1(MiB(big.resTau.wave1SendBytes))} | ${big.resTau.maxWorkerPages} |`
-  );
-  console.log(
-    `| ${mid.p} | ${mid.nPoints} | ${mid.resTau.bitChunkSize} | ${mid.resTau.nBitChunks} | ${mid.resTau.nPointChunks} | ${mid.resTau.taskCount} | ${f1(MiB(mid.resTau.perTaskSendMax))} | ${f1(MiB(mid.resTau.wave1SendBytes))} | ${mid.resTau.maxWorkerPages} |\n`
-  );
+  const showPowers = (phase) => {
+    const rows = [];
+    for (const sec of ['tauG1', 'tauG2']) {
+      for (const r of powerRowsFromPlan(plan, sec, phase)) {
+        if (r.power >= power - 1) rows.push({ sec, r });
+      }
+    }
+    return rows;
+  };
 
-  console.log('#### C. phase 2 -- resLagrange, 32 B scalars after fft (powersoftau_verify.js:454,482)\n');
-  console.log('| p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages | worker WASM (MiB) |');
-  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  console.log(
-    `| ${big.p} | ${big.nPoints} | ${big.resLagrange.bitChunkSize} | ${big.resLagrange.nBitChunks} | ${big.resLagrange.nPointChunks} | ${big.resLagrange.taskCount} | ${f1(MiB(big.resLagrange.perTaskSendMax))} | ${f1(MiB(big.resLagrange.wave1SendBytes))} | ${big.resLagrange.maxWorkerPages} | ${f1(MiB(big.resLagrange.workerMemBytes))} |`
-  );
-  console.log(
-    `| ${mid.p} | ${mid.nPoints} | ${mid.resLagrange.bitChunkSize} | ${mid.resLagrange.nBitChunks} | ${mid.resLagrange.nPointChunks} | ${mid.resLagrange.taskCount} | ${f1(MiB(mid.resLagrange.perTaskSendMax))} | ${f1(MiB(mid.resLagrange.wave1SendBytes))} | ${mid.resLagrange.maxWorkerPages} | ${f1(MiB(mid.resLagrange.workerMemBytes))} |\n`
-  );
+  console.log('#### B. phase 2 -- resTau, 4 B scalars (powersoftau_verify.js:425,452) -- every group, largest powers\n');
+  console.log('| section | group | p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | cold-start pages | pool delta | grew |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const { sec, r } of showPowers('resTau')) {
+    const cold = Math.max(...r.wave1Pages, r.lateMaxNeedAtInit || 0);
+    console.log(
+      `| ${sec} | ${r.group} | ${r.power} | ${r.nPoints} | ${r.bitChunk} | ${r.nBit} | ${(r.chunkPts || []).length} | ${r.taskCount} | ${f1(MiB(r.perTaskSendMax))} | ${f1(MiB(r.wave1SendBytes))} | ${cold} | ${r.deltaPages} | ${r.grewWorkers} |`
+    );
+  }
+  console.log('');
+
+  console.log('#### C. phase 2 -- resLagrange, 32 B scalars after fft (powersoftau_verify.js:454,482) -- every group, largest powers\n');
+  console.log('| section | group | p | points | bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | cold-start pages | pool delta | grew |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const { sec, r } of showPowers('resLagrange')) {
+    const cold = Math.max(...r.wave1Pages, r.lateMaxNeedAtInit || 0);
+    console.log(
+      `| ${sec} | ${r.group} | ${r.power} | ${r.nPoints} | ${r.bitChunk} | ${r.nBit} | ${(r.chunkPts || []).length} | ${r.taskCount} | ${f1(MiB(r.perTaskSendMax))} | ${f1(MiB(r.wave1SendBytes))} | ${cold} | ${r.deltaPages} | ${r.grewWorkers} |`
+    );
+  }
+  console.log('');
 
   console.log('#### D. Fr batchTo/FromMontgomery -- 32 B in/out, TWO allocations per chunk (engine_batchconvert.js:23-32)\n');
-  console.log('| p | points | chunks | pts/chunk (last) | bytes/chunk ALLOCSET+ALLOC | pages after | workers grown | worker WASM (MiB) | main-thread transient add (MiB) |');
-  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  for (const r of [bcBig, bcMid]) {
-    console.log(
-      `| ${log2floor(r.nPoints)} | ${r.nPoints} | ${r.taskCount} | ${r.pointsPerChunk} (${r.chunks[r.chunks.length - 1].points}) | ${r.perChunkBytes} | ${r.maxPages} | ${r.grownWorkers} | ${f1(r.workerCapacityMiB)} | ${f1(MiB(r.mainThread.transientAddBytes))} |`
-    );
+  console.log('| section | op | p | points | chunks | pts/chunk (last) | ALLOCSET (B) | ALLOC (B) | cold-start pages | pages before call | in-run pool delta | grew |');
+  console.log('| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const sec of ['tauG1', 'tauG2']) {
+    for (const op of ['batchToMontgomery', 'batchFromMontgomery']) {
+      for (const r of powerRowsFromPlan(plan, sec, op)) {
+        if (r.power < power - 1) continue;
+        const lastPts = batchTasks(r.nPoints, concurrency, S.Fr, S.Fr).slice(-1)[0].pts;
+        const cold = Math.max(...r.wave1Pages, r.lateMaxNeedAtInit || 0);
+        const before = Math.min(...r.workerPagesBefore);
+        console.log(
+          `| ${sec} | ${op.replace('Montgomery', '')} | ${r.power} | ${r.nPoints} | ${r.taskCount} | ${r.perTaskSendMax / (S.Fr * 2)} (${lastPts}) | ${r.perTaskSendMax / 2} | ${r.perTaskSendMax / 2} | ${cold} | ${before} | ${r.deltaPages} | ${r.grewWorkers} |`
+        );
+      }
+    }
   }
   console.log(
-    `\nbinding check: resTau leaves ${big.resTau.maxWorkerPages} pages/worker, batchconvert needs ${bcBig.maxPages} -> ` +
-      `${bcBig.maxPages > big.resTau.maxWorkerPages ? 'BINDS (adds memory)' : 'non-binding at this iteration'}; ` +
-      `absolute level ${bcBig.maxPages} pages x ${concurrency} workers = ${f1(bcBig.workerCapacityMiB)} MiB.\n`
+    '\nCold-start pages are the requirement on a pristine 25-page worker; "in-run pool delta" is what the same call\ncosts inside prepared_verify, where resTau already ran. M5-B/C read the second column from wasm_before/after.\n'
   );
 
-  const inc = big.resLagrange.wave1SendBytes + (big.resLagrange.workerMemBytes - p1.baselineBytes);
-  console.log(`#### E. tauG1 phase-2 segment increment (model, same window as M4.1)\n`);
+  const bigLag = lastCall(plan, `tauG1.p${power + 1}.resLagrange`);
+  const inc = bigLag ? bigLag.wave1SendBytes : 0;
+  console.log('#### E. tauG1 phase-2 segment increment (model, same window as M4.1)\n');
   console.log('| term | MiB |');
   console.log('| --- | ---: |');
-  console.log(`| resLagrange in-flight | ${f1(MiB(big.resLagrange.wave1SendBytes))} |`);
-  console.log(`| resLagrange worker WASM | ${f1(MiB(big.resLagrange.workerMemBytes))} |`);
-  console.log(`| minus phase-1 baseline | ${f1(-p1.baselineMiB)} |`);
-  console.log(`| **model increment** | **${f1(MiB(inc))}** |`);
-  console.log(`\nFr FFT @2^${big.p}: ${fft.nChunks} chunks x ${fft.pointsInChunk} pts, in-flight ${f1(MiB(fft.inflightPeakBytes))} MiB, worker WASM ${f1(MiB(fft.workerMemBytes))} MiB, input copy ${f1(MiB(fft.inputCopyBytes))} MiB`);
-  console.log('\nAll worker-memory figures assume allocator base 0 and a descending\n(schedule-favourable) task-to-worker assignment: they are UPPER bounds.\n');
+  console.log(`| resLagrange in-flight | ${f1(MiB(inc))} |`);
+  console.log(`| phase-1 exit pool (replaced by measurement) | ${f1(MiB(pool1 * PAGE_BYTES))} |`);
+  console.log(`\nFr FFT @2^${power + 1}: ${fft.nChunks} chunks x ${fft.pointsInChunk} pts, in-flight ${f1(MiB(fft.inflightPeakBytes))} MiB, worker WASM ${f1(MiB(fft.workerMemBytes))} MiB, input copy ${f1(MiB(fft.inputCopyBytes))} MiB`);
+  console.log('\nEvery column above is produced by one sequential replay of the real call order; the only free parameter\n' +
+    'is the allocator base, which the probe measures (worker_task.alloc_base) rather than assumes.\n');
 
-  return { power, concurrency, phase1: p1, resTau: big.resTau, resLagrange: big.resLagrange, fft, batchConvert: { big: bcBig, mid: bcMid }, inc };
+  return { power, concurrency, baseBytes, plan, rows: p1rows, fft, poolAtPhase2: pool1 };
 }
 
 function printBatchConvert(power, concurrency) {
@@ -763,18 +787,23 @@ function printBatchConvert(power, concurrency) {
   return rows;
 }
 
-function printPhase1(power, concurrency) {
-  const p1 = phase1Ledger(power, concurrency);
-  console.log(`### phase 1 only @ power ${power} (concurrency ${concurrency})\n`);
-  console.log('| section | group | points | 64 Ki-chunks | MSM points | 4 B bitChunk | bit-chunks | point-chunks | tasks | per-task (MiB) | in-flight (MiB) | worker pages |');
-  console.log('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
-  for (const r of p1.rows) {
+function printPhase1(power, concurrency, baseBytes = 0) {
+  const plan = buildPlan(power, concurrency, baseBytes);
+  const rows = phase1RowsFromPlan(plan);
+  console.log(`### phase 1 only @ power ${power} (concurrency ${concurrency}, alloc base ${baseBytes} B)\n`);
+  console.log('| section | group | points | 64 Ki-chunks | MSM points | outer bitChunk | inner bit-chunks | point-chunks | tasks per 64 Ki | per-task (MiB) | in-flight (MiB) | worker pages (max) | pool after (pages) |');
+  console.log('| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of rows) {
     console.log(
-      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.worst.bitChunkSize} | ${r.worst.nBitChunks} | ${r.worst.nPointChunks} | ${r.worst.taskCount} | ${f1(MiB(r.worst.perTaskSendMax))} | ${f1(MiB(r.worst.wave1SendBytes))} | ${r.worst.maxWorkerPages} |`
+      `| ${r.name} | ${r.group} | ${r.nPoints} | ${r.nChunks} | ${r.msmPoints} | ${r.bitChunkSize} | ${r.innerBitChunks.join('/')} | ${r.nPointChunks} | ${r.taskCount} | ${f1(MiB(r.perTaskSendMax))} | ${f1(MiB(r.wave1SendBytes))} | ${r.maxWorkerPages} | ${r.sectionPoolPages} |`
     );
   }
-  console.log(`\nbaseline = ${p1.grownWorkers} x ${p1.grownPages} pages + ${concurrency - p1.grownWorkers} x 25 pages = **${f1(p1.baselineMiB)} MiB** (driver: ${p1.driver})`);
-  return p1;
+  const pool = plan.poolAtPhase2;
+  console.log(
+    `\nphase-1 exit pool = ${pool} pages = **${f1(MiB(pool * PAGE_BYTES))} MiB** over ${concurrency} workers (sequential high-water model, base ${baseBytes} B)`
+  );
+  console.log('worker pages at phase-2 start: ' + JSON.stringify(lastCall(plan, 'phase1.').workerPagesAfter));
+  return { power, concurrency, baseBytes, rows, poolAtPhase2: pool, poolMiB: MiB(pool * PAGE_BYTES) };
 }
 
 function printPreparePhase2(power, concurrency) {
@@ -801,17 +830,18 @@ function main(argv) {
     return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
   };
   const power = Number(arg('power', 18));
+  const baseBytes = Number(arg('base', 0));
   const operation = arg('operation', 'prepared_verify');
   const concurrency = Number(arg('concurrency', Math.min(os.cpus().length, 64)));
   const asJson = argv.includes('--json');
 
   let out;
-  if (operation === 'prepared_verify') out = asJson ? null : printPreparedVerify(power, concurrency);
-  else if (operation === 'phase1') out = printPhase1(power, concurrency);
+  if (operation === 'prepared_verify') out = asJson ? null : printPreparedVerify(power, concurrency, baseBytes);
+  else if (operation === 'phase1') out = printPhase1(power, concurrency, baseBytes);
   else if (operation === 'prepare_phase2') out = printPreparePhase2(power, concurrency);
   else if (operation === 'batchconvert') out = printBatchConvert(power, concurrency);
-  else if (operation === 'pool') out = printPool(power, concurrency);
-  else if (operation === 'segments') out = printSegments(power, concurrency);
+  else if (operation === 'pool') out = printPool(power, concurrency, baseBytes);
+  else if (operation === 'segments') out = printSegments(power, concurrency, baseBytes);
   else if (operation === 'plan') out = null;
   else {
     console.error(`unknown --operation ${operation} (prepared_verify | phase1 | prepare_phase2 | batchconvert | pool | segments | plan)`);
@@ -820,7 +850,7 @@ function main(argv) {
 
   if (operation === 'plan') {
     // L1 oracle: the complete execution plan, every call, every power.
-    const plan = buildPlan(power, concurrency);
+    const plan = buildPlan(power, concurrency, baseBytes);
     const calls = plan.calls.map((c, i) => ({
       i,
       site: c.site,
@@ -851,9 +881,10 @@ function main(argv) {
         {
           power,
           concurrency,
+          alloc_base_bytes: baseBytes,
           generator: 'scripts/m5_budget.cjs --operation plan',
           assumptions: [
-            'allocator base offset = 0 (HYP-1, lower bound; replaced by worker_task.alloc_base)',
+            'allocator base offset = ' + baseBytes + ' B (from worker_task.alloc_base; M5-C measured 102328 at p10)',
             'first wave = tasks 0..C-1 on workers 0..C-1 in (point-chunk outer, bit-chunk inner) order',
             'late tasks charged only when no worker could absorb them (late_provably_free)',
           ],
@@ -915,8 +946,10 @@ if (require.main === module) main(process.argv.slice(2));
 module.exports = {
   replayWorkerMemory,
   msmCall,
-  phase1Ledger,
-  verifyPowerLedger,
+  phase1RowsFromPlan,
+  powerRowsFromPlan,
+  callsMatching,
+  lastCall,
   fftLedger,
   batchConvertLedger,
   newPool,
@@ -927,4 +960,5 @@ module.exports = {
   fftTasks,
   buildPlan,
   callInIsolation,
+  pagesAtInit,
 };

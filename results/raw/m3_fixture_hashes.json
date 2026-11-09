@@ -1,0 +1,81 @@
+{
+    "record":  "M3 fixture identities",
+    "generated_at_utc":  "2026-11-06T08:47:10.2729192Z",
+    "fixtures":  [
+                     {
+                         "file":  "data/fixtures/pot10_0000.ptau",
+                         "bytes":  590080,
+                         "sha256":  "9096c1886d3d094777d572a991c4523991ce3491bd6affc503a045e61a3902dc"
+                     },
+                     {
+                         "file":  "data/fixtures/pot10_0001.ptau",
+                         "bytes":  592215,
+                         "sha256":  "86b13f3cb014f02e2157b5c659baa29e943d4d75f7f2018c70db7b26b9345f5c"
+                     },
+                     {
+                         "file":  "data/fixtures/pot10_final.ptau",
+                         "bytes":  1771431,
+                         "sha256":  "5a77b9a84788c181cbe8c80da7c0c5afcf02ef87353ed2d1a7063b21c0e27e79"
+                     },
+                     {
+                         "file":  "data/fixtures/pot12_0000.ptau",
+                         "bytes":  2359552,
+                         "sha256":  "0280084087d88e6b1b61250431eab40ef641d68619f36f74d6d90108540b0403"
+                     },
+                     {
+                         "file":  "data/fixtures/pot12_0001.ptau",
+                         "bytes":  2361683,
+                         "sha256":  "eda9439b2a96c1204bad169584669304488b7102faf51065e81478bd28248deb"
+                     },
+                     {
+                         "file":  "data/fixtures/pot12_final.ptau",
+                         "bytes":  7079843,
+                         "sha256":  "e3ed5d55ee638e9cb1fc699952da5091678979e9d2282dead2f06e547f884dec"
+                     },
+                     {
+                         "file":  "data/fixtures/pot14_0000.ptau",
+                         "bytes":  9437440,
+                         "sha256":  "07c098825f787f7c45e503034ba2cc5bc22a3a870a17a9690dcac08288800135"
+                     },
+                     {
+                         "file":  "data/fixtures/pot14_0001.ptau",
+                         "bytes":  9439571,
+                         "sha256":  "5c801f245a2c89e93638db54f9ee4a0c13930f4f964ec24c6f10e3f1bed7db63"
+                     },
+                     {
+                         "file":  "data/fixtures/pot14_final.ptau",
+                         "bytes":  28313507,
+                         "sha256":  "747cd61c8a4d0e8cf9d567dcacd63ea974aebab49cf7b599cf9847533120d3a5"
+                     },
+                     {
+                         "file":  "data/fixtures/pot16_0000.ptau",
+                         "bytes":  37748992,
+                         "sha256":  "528ee96e5cec968a2e98704a9c0aae32c92fd81b434d3ef7df8b20ed1419d550"
+                     },
+                     {
+                         "file":  "data/fixtures/pot16_0001.ptau",
+                         "bytes":  37751121,
+                         "sha256":  "83eb98d6a3c7fedf1e4afe6d932221d127b38ec5e6d85be92a6ccf325bd5e3b3"
+                     },
+                     {
+                         "file":  "data/fixtures/pot16_final.ptau",
+                         "bytes":  113248161,
+                         "sha256":  "a158bd58663d4ace51810244d6af02837b13af2e00472e605f7f94a65766739d"
+                     },
+                     {
+                         "file":  "data/fixtures/pot18_0000.ptau",
+                         "bytes":  150995200,
+                         "sha256":  "b70fcfbbbad64832a46c1f5c38c0fff4d65b4c4a58d9a5fd2cee806458837f62"
+                     },
+                     {
+                         "file":  "data/fixtures/pot18_0001.ptau",
+                         "bytes":  150997329,
+                         "sha256":  "ed5b4288098800c54f7f429f68e94f6fec7ff5613be0659800bd4fb4ddfb86a1"
+                     },
+                     {
+                         "file":  "data/fixtures/pot18_final.ptau",
+                         "bytes":  452986785,
+                         "sha256":  "19546863d290fbaf67a34a0f8ec4992a241c6c2831ef2f3a3135c0d5a885f2cd"
+                     }
+                 ]
+}

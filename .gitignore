@@ -20,6 +20,10 @@
 !/results/processed/m4_*.csv
 !/results/processed/m4_*.md
 
+# M5 committed artifacts: probe perturbation summary only (JSONL / timelines stay local).
+!/results/processed/m5*.csv
+!/results/processed/m5*.md
+
 # results/processed/M2-public-dataset/ (+ .zip) stay local: they contain binary
 # parameter files and are covered by /results/processed/* above.
 
