@@ -15,6 +15,18 @@
  * `grow_events[]` and `wasm_after` to match EXACTLY, per worker, per event.
  * There is no whole-page tolerance: every input to the replay is measured.
  *
+ * M5-E.1 additions (review finding #4.2):
+ *   - per-worker continuity: wasm_after(task k) must equal wasm_before(task k+1)
+ *     on the same worker. Without this the replay only proves each task correct
+ *     in isolation, not that the per-worker capacity history is one chain.
+ *   - alloc_base must be the SAME constant on every task of every worker
+ *     (HYP-1's "0" would still replay if alloc_base were read per task).
+ *   - grow_events[].len and .top are compared, not only from/to pages: they tie
+ *     the grow to a specific allocation, so a reordering inside alloc() shows up.
+ *   - task_send.wasm_alloc_bytes must equal sum(allocs) -- the two are produced
+ *     by independent code paths (main-thread command scan vs. worker-side alloc
+ *     counter), so agreement is a real cross-check of the byte accounting.
+ *
  * Usage:
  *   node scripts/m5_check_l2.cjs --jsonl results/raw/m5_p18_r1.jsonl [--verbose]
  */
@@ -40,6 +52,7 @@ function main() {
 
   const tasks = [];
   const sends = new Map();
+  let byteCheck = { n: 0, bad: 0 };
   for (const line of fs.readFileSync(jsonlPath, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     let e;
@@ -61,6 +74,7 @@ function main() {
   const bases = new Set();
   let grows = 0;
   let maxPages = 0;
+  const lastAfter = new Map(); // worker -> wasm_after of its previous task
 
   for (const t of tasks) {
     const base = t.alloc_base;
@@ -74,7 +88,7 @@ function main() {
       top += allocs[i];
       if (top + allocs[i] > pages * PAGE) {
         let req = Math.floor((top + allocs[i]) / PAGE) + 1;
-        computed.push({ at_alloc: i, len: allocs[i], from_pages: pages, to_pages: req });
+        computed.push({ at_alloc: i, len: allocs[i], from_pages: pages, to_pages: req, top });
         pages = req;
       }
     }
@@ -83,6 +97,7 @@ function main() {
       len: g.len,
       from_pages: g.from_pages,
       to_pages: g.to_pages,
+      top: g.top,
     }));
 
     let ok = true;
@@ -106,6 +121,11 @@ function main() {
           problems.push(
             `task ${t.task_id} (w${t.worker} ${t.site}) grow#${k}: replay ${a.from_pages}->${a.to_pages} @alloc${a.at_alloc}, observed ${b.from_pages}->${b.to_pages} @alloc${b.at_alloc}`
           );
+        } else if (a.len !== b.len || a.top !== b.top) {
+          ok = false;
+          problems.push(
+            `task ${t.task_id} (w${t.worker} ${t.site}) grow#${k}: replay len=${a.len} top=${a.top}, observed len=${b.len} top=${b.top}`
+          );
         }
       }
     }
@@ -124,9 +144,47 @@ function main() {
       }
     }
 
+    // byte accounting cross-check: main-thread command scan vs worker alloc list
+    const send = sends.get(t.task_id);
+    if (send && send.wasm_alloc_bytes !== undefined && send.wasm_alloc_bytes !== null) {
+      byteCheck.n += 1;
+      const sumAllocs = allocs.reduce((x, y) => x + y, 0);
+      if (send.wasm_alloc_bytes !== sumAllocs) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 5) {
+          problems.push(
+            `task ${t.task_id}: task_send.wasm_alloc_bytes ${send.wasm_alloc_bytes} != sum(allocs) ${sumAllocs}`
+          );
+        }
+      }
+      if (send.clone_buffer_bytes !== (t.allocset_bytes || 0) + (t.set_bytes || 0)) {
+        byteCheck.bad += 1;
+        if (byteCheck.bad <= 5) {
+          problems.push(
+            `task ${t.task_id}: task_send.clone_buffer_bytes ${send.clone_buffer_bytes} != allocset+set ${(t.allocset_bytes || 0) + (t.set_bytes || 0)}`
+          );
+        }
+      }
+    }
+
     grows += observed.length;
     if (pages > maxPages) maxPages = pages;
-    const w = perWorker.get(t.worker) || { tasks: 0, pages: 0, base: base, fails: 0 };
+    // per-worker continuity: the capacity at entry must be what the previous task
+    // on this worker left behind. Worker tasks are strictly sequential (the
+    // scheduler refuses to post to a busy worker), so file order per worker IS
+    // the execution order.
+    const prev = lastAfter.get(t.worker);
+    if (prev !== undefined && prev !== t.wasm_before) {
+      ok = false;
+      problems.push(
+        `worker ${t.worker} task ${t.task_id}: wasm_before ${t.wasm_before} != previous wasm_after ${prev} -- history is not a chain`
+      );
+    }
+    lastAfter.set(t.worker, t.wasm_after);
+
+    const w = perWorker.get(t.worker) || { tasks: 0, pages: 0, base: base, fails: 0, bases: new Set() };
+    if (!w.bases) w.bases = new Set();
+    w.bases.add(base);
     w.tasks += 1;
     w.pages = Math.max(w.pages, Math.round(t.wasm_after / PAGE));
     if (!ok) w.fails += 1;
@@ -140,6 +198,15 @@ function main() {
   console.log(`grows   : ${grows} memory.grow events replayed`);
   console.log(`maxpages: ${maxPages}`);
   console.log(`workers : ${perWorker.size}`);
+
+  for (const [w, v] of perWorker) {
+    if (v.bases && v.bases.size > 1) {
+      problems.push(`worker ${w}: ${v.bases.size} distinct alloc_base values (${[...v.bases].join(', ')})`);
+    }
+  }
+  const chained = lastAfter.size;
+  console.log(`history : ${tasks.length - chained === 0 ? chained : chained} worker histories chained (wasm_after -> next wasm_before)`);
+  console.log(`bytes   : ${byteCheck.n - byteCheck.bad}/${byteCheck.n} tasks agree on clone_buffer_bytes and wasm_alloc_bytes`);
 
   const rows = [...perWorker.entries()].sort((a, b) => a[0] - b[0]);
   console.log('\nworker  tasks   max pages   alloc_base   replay fails');

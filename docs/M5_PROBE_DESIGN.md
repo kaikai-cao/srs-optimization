@@ -58,13 +58,14 @@
 
 ---
 
-## 1. 结论摘要（给评审的 8 条）
+## 1. 结论摘要（给评审的 9 条）
 
 1. **must-fix 已修**：`snarkjs` 在三个地方喂不同宽度的标量——`processSection` 4 B、`resTau` 4 B、`resLagrange` 32 B。
    A 稿把 32 B 的位块放大（18 个 bit-chunk）套到了全部 MSM 上，导致 Phase 1 基线与"2% 吻合"两个结论都不成立。
 2. **位块放大机制本身成立，但只对 32 B 路径成立，且位块数要按"分片点数"算**：p18 的 `resLagrange` 在 `2^19`
    点上是 2 个 point-chunk（337,042 / 187,246 点），内层 `pTSizes` 分别给 **19 / 20** 个位块 → **39 任务**、
-   单任务 41.1 MiB、在途 **987.4 MiB**；而同一次 `verifyPower(19)` 里先跑的 `resTau`（4 B）只有 3 个位块 ×
+   单任务 41.1 MiB、在途 **987.4 MiB**（这是"从 postMessage 到收到回复"的上端口径；只算 Worker 真正在跑的那段
+   是 **932.6 MiB**，两者之差是排队中的副本）；而同一次 `verifyPower(19)` 里先跑的 `resTau`（4 B）只有 3 个位块 ×
    10 point-chunk = 30 任务、单任务 5.4 MiB、在途 146.4 MiB。
 3. **Worker WASM 的双倍余量机制成立**（`alloc()` 把 `length` 加了两次），而且首轮映射是**确定的**：
    `processWorks()` 从 0 号 Worker 顺序取空闲（`threadman.js:191-198`），`_multiExpChunk()` 在 `await` 前把整批
@@ -78,9 +79,10 @@
    p16 三次是 **+194 / +207 / +238**（均值 213），模型 **594.2** = 265.1 + 329.1 为 **2.79×**。
    两个 power 的偏差方向相反，**所以"上界"这个身份也不成立**——三次实测的离散已经大于模型与实测的差，
    这个比较**不能用来判定模型对错**（§5.6）。
-6. **原 H1（FFT 输入副本）在 `prepared_verify @ p18` 上只有约 48 MiB**（16 输入副本 + 16 分片 + 16 输出），
-   相对 MSM 的 987 + 1,409 可忽略；`prepare_phase2` 相反，FFT 才是主路径，但它与实测的残差目前**无法解释**，
-   只能说"模型漏了东西"，不能断言是碎片。
+6. **原 H1（FFT 输入副本）在 `prepared_verify @ p18` 上只有约 32 MiB**（16 输入副本 + 16 输出；
+   分片数组在同一时刻为空），相对 MSM 的 987 + 1,409 很小，**但"已排除"这个说法在 M5-E.1 被撤回**：
+   FFT 的 Worker 消息缓冲区确实只有 14 MiB，可 `_fft` 主线程上的三份数据（`buff` / `chunks[]` / `buffOut`）
+   的生命周期还没有建模，只能说"贡献未定量"。`prepare_phase2` 相反，FFT 才是主路径。
 7. **账目 D（`Fr.batchTo/FromMontgomery`）此前漏记，现已补上，但它是"冷启动预算"而非本次扩容**：
    每个 chunk 做**两次**分配（`ALLOCSET` 599,168 B + `ALLOC` 599,168 B），若从 25 页起跑会被
    `alloc()` 的双计推到 **30 页/Worker**（28 个合计 **52.5 MiB**；基址 0 时 28 页）；但它在同一次 `verifyPower` 里
@@ -91,6 +93,11 @@
    把 **19** 个 Worker 从 989 抬到 1044（各 +55）、把**第 20 个**从 551 抬到 1044（+493），其余 8 个不动
    （496 < 551），**池增量 1,538 页 = 96.1 MiB**。写成"28 个 Worker 各 +55 页"会得到 1,540 页 = 96.25 MiB，
    总量只差 0.15 MiB 但归属完全不同——所以 L2 必须逐 Worker 核对。
+9. **M5-E.1 用真实 grow 时间戳推翻了一个结论**：M5-E 说"在途峰时容量只有 778.3 MiB，两者不同时在场"。
+   778.3 MiB 是"主线程已收到增长报告"的容量。把 `memory.grow` 的时间戳记进 `alloc()` 之后，在途峰那一刻
+   的容量是 **1,484.4 MiB（p18，终值的 93.9%）/ 404.4 MiB（p16，94.8%）**——**两者同时在场**。
+   同时 `send_bytes` 被拆成 `clone_buffer_bytes` / `wasm_alloc_bytes` / `worker_output_bytes`，
+   batch 与 FFT 路径的旧口径分别虚高 3.0× / 2.2×。详见 `docs/M5_ATTRIBUTION.md`。
 
 ---
 
@@ -235,10 +242,10 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 
 | section | 群 | 点数 | 64 Ki 分片 | MSM 点数 | 外层 bitChunk | 内层位块（每分片各算） | point-chunk | 每 64 Ki 任务数 | 单任务 MiB | 在途 MiB | 单 Worker 页（最大） | 段末容量池（页） |
 | --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| tauG1 | G1 | 524287 | 8 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.8 | **25** | 700 |
-| **tauG2** | **G2** | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 1.3 | 36.8 | **43** | **1204** |
-| alphatauG1 | G1 | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.8 | 43 | 1204 |
-| betatauG1 | G1 | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.8 | 43 | 1204 |
+| tauG1 | G1 | 524287 | 8 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.7 | **25** | 700 |
+| **tauG2** | **G2** | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 1.3 | 36.7 | **43** | **1204** |
+| alphatauG1 | G1 | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.7 | 43 | 1204 |
+| betatauG1 | G1 | 262144 | 4 | 65535 | 12 | 9×9 + 1×8 | 10 | 40 | 0.7 | 18.7 | 43 | 1204 |
 
 - **phase 1 结束 = phase 2 起点：1,204 页 = 75.3 MiB（28 × 43 页）**。基址取 0 时是 1,176 页 = 73.5 MiB，
   差 2 页/Worker 全部来自 102,328 B 基址把一个 43 页判据推过了整页边界——**不是新的分配，只是同一个判据的舍入**。
@@ -462,41 +469,43 @@ Worker 容量由"最大 point-chunk"决定、在并发度固定时同样随 `N` 
 `cli.cjs:3555+`），没有经过任何 `queueAction` 调用点，因此拿不到 `site`。探针按"记录但标 `unlabeled`"处理，
 L1 只对它做"存在且可回放"的校验，不计入逐调用比对。
 
-### 5.9 扰动预算：探针本身会不会改变被测对象（p10，三模式各 5 次）
+### 5.9 扰动预算：探针本身会不会改变被测对象
 
-`results/raw/m5c/` 下三组各 5 次，同一 fixture、同一命令行，唯一差别是"加载谁 + 是否写 JSONL"：
+#### p10，三模式各 5 次（探针 v2，M5-E.1 重测）
 
-| 模式 | 发生了什么 | peak WS（MiB，5 次） | 中位 | 耗时中位 | 耗时（ms，5 次） |
-| --- | --- | --- | ---: | ---: | --- |
-| `pristine` | `node_modules` + 无 hook | 613.5 / 554.4 / 555.1 / 556.9 / 613.1 | **557** | **1,885** | 1913 / 1869 / 1842 / 1911 / 1885 |
-| `vendor` | vendor 副本 + hook，`M5_TRACE=0` | 626.4 / 625.1 / 589.4 / 589.3 / 565.7 | **589** | **1,913** | 1525 / 1874 / 1913 / 2164 / 1974 |
-| `trace` | vendor 副本 + hook，`M5_TRACE=1` | 622.6 / 565.2 / 628.3 / 595.4 / 570.5 | **595** | **2,067** | 2067 / 1971 / 1940 / 2082 / 2111 |
+`results/raw/m5e10/` 下三组各 5 次，同一 fixture、同一命令行，唯一差别是"加载谁 + 是否写 JSONL"：
 
-**三条结论，按可主张的强度排序**：
+| 模式 | 发生了什么 | peak WS（MiB，5 次） | 中位 | 耗时（ms，5 次） | 中位 |
+| --- | --- | --- | ---: | --- | ---: |
+| `pristine` | `node_modules` + 无 hook | 557.9 / 560.3 / 550.0 / 609.8 / 576.5 | **560** | 2089 / 1885 / 1955 / 1908 / 1858 | **1,908** |
+| `vendor` | vendor 副本 + hook，`M5_TRACE=0` | 564.3 / 565.7 / 625.3 / 565.7 / 631.2 | **566** | 1958 / 1925 / 1972 / 1935 / 1952 | **1,952** |
+| `trace` | vendor 副本 + hook，`M5_TRACE=1` | 565.2 / 570.2 / 559.1 / 565.6 / 589.8 | **565** | 2077 / 2001 / 1989 / 2097 / 2124 | **2,077** |
 
-1. **换 bundle 本身是免费的**：`pristine` 与 `vendor` 的耗时中位差 28 ms（1.5%），且 `vendor` 有一次 1,525 ms
-   的离群低值——说明加载补丁版 bundle 不引入可测的时间成本。这一条是"可以主张"的。
-2. **写 JSONL 有约 +9% 的固定成本**：`trace` 的 5 次全部 ≥ 1,940 ms，而 `pristine` 的 4/5 与 `vendor` 的 4/5
-   都 ≤ 1,974 ms；中位差 +182 ms（相对 pristine +9.7%，相对 vendor +8.1%）。30,537 条事件、6.9 MB 落盘，
-   这个量级合理。**因此任何"trace 与 pristine 的时间对比"都必须先声明约 9% 的系统性偏差**。
-3. **peak WS 无法用来判定探针扰动**：三种模式的区间几乎完全重叠（554–628 MiB），而**同一模式内**的极差就有
-   59–63 MiB（`pristine` 自身出现 555 与 613 两个簇）。也就是说，"模式之间的差"小于"同一模式内的差"，
-   n=5 不足以分离。**结论：p16/p18 的归因不得以 peak WS 作为主判据**，只能作并列参考量；
-   主判据仍是逐 Worker 的 `allocs / grow_events / wasm_after`（L1/L2 已可执行且五次全部 PASS）。
+三条结论（与探针 v1 一致，量级未变）：
 
-> 这一点也回溯修正了 M4.1 的读法：M4.1 每个档位三次读数、把极差当"±10% 噪声"是**过强**的表述，
-> 真实情况是 peak WS 在 p10 就有两个簇；档位之间的 44 MiB（p16）差异很可能小于同一档位内的波动。
+1. **换 bundle 本身基本免费**：中位差 44 ms（2.3%），且三次 `vendor` 读数落在 `pristine` 的区间内。
+2. **写 JSONL 有约 +9% 的固定成本**：中位差 +169 ms（相对 pristine +8.9%）。30,537 条事件、6.9 MB 落盘。
+   任何"trace vs pristine 的耗时对比"都必须先声明这个系统性偏差。
+3. **peak WS 无法判定扰动**：三组区间完全重叠（550–631 MiB），同一模式内的极差就有 42–66 MiB，
+   大于模式之间的差。
 
-**复现命令**（三次模式各 5 次，约 30 秒）：
+#### p16 / p18：真实规模上的交错复核
 
-```
-measure_m5.ps1 -Operation prepared_verify -Power 10 -InputPath data/fixtures/pot10_final.ptau -Mode trace -Repeats 5 -ResultsDir results/raw/m5c -LogDir results/raw/m5c/logs
-```
+| power | pristine peak WS | trace peak WS | pristine 耗时 | trace 耗时 |
+| --- | --- | --- | --- | --- |
+| 16 | 1,636.5 / 1,656.9 / 1,571.0 | 1,646.2 / 1,616.0 / 1,625.0 | 12.7 / 13.7 / 13.8 s | 13.3 / 13.4 / 13.9 s |
+| 18 | 3,687.0 / 3,640.5 / 3,883.8 | 3,675.6 / 3,861.1 / 3,741.1 | 42.6 / 43.4 / 42.5 s | 42.8 / 43.3 / 60.5 s |
 
-五次 trace 的 L1/L2 全部通过（237/237 调用、10,084 任务、0 fails），说明探针输出本身是可复现的，
-而 peak WS 的离散来自被测进程，不是探针。
+- p16 的耗时代价约 **+2%**，p18 约 **+1%**（一次 60.5 s 的离群值按噪声处理）——9% 的写盘成本被更长的运行摊薄。
+- peak WS 在两档都是区间重叠，**没有一档能靠 WS 分辨出模式差**。
+
+> 这也回溯修正了 M4.1 的读法：M4.1 每档三次读数、把极差当"±10% 噪声"是过强的表述。
+> 即使同一台机器同一天，p18 的 peak WS 三次就分布在 3,640–3,884 MiB；换一天重跑又是 3,676–3,861。
+> **任何跨批次比较 WS 的做法都不成立**，只有同一批交错运行之间的比较才有意义。
 
 ---
+
+## 6. 可检验假设---
 
 ## 6. 可检验假设
 
@@ -585,36 +594,45 @@ for (let i = 0; i < nPoints; i += chunkSize) {
 
 | 事件 | 触发点 | 关键字段 |
 | --- | --- | --- |
-| `provenance` | 启动 | `resolved, sha256, patch_sha256, ffjavascript_version, node` |
-| `anchor` | 启动 | `epoch_ms, hr_ns, concurrency, page_bytes:65536, allocator_base_assumed` |
-| `msm_plan` | `_multiExp` 入口 | `call_id, site, group, p, n_points, s_scalar, bit_chunk, n_bit, n_point_chunk, chunk_pts[]` |
-| `batch_plan` | `batchConvert` 入口 | `call_id, site, n_points, s_in, s_out, n_chunks, chunk_points[]` |
-| `fft_plan` | `_fft` 入口 | `call_id, op, p, n_points, bits, points_in_chunk, n_chunks, copy_bytes` |
-| `task_send` | `postAction` | `task_id, call_id, worker, site, send_bytes, inflight, queue_depth, ts` |
-| `task_done` | `getOnMsg` | `task_id, worker, svc_ms, inflight_after` |
-| `worker_task` | worker `runTask` 末尾 | `worker, task_id, call_id, alloc_base, wasm_before, wasm_after, alloc_top, grows, allocs[], grow_events[], allocset_bytes, get_bytes, w_heap_used, w_external, w_array_buffers` |
-| `heap_sample` | 主线程 200 ms | `rss, heap_used, external, array_buffers` |
-| `fft_assembly` | `_fft` 末尾 | `copy_bytes, chunks_bytes, out_bytes` |
+| `provenance` | 启动 | `run_id, resolved, sha256, node` |
+| `anchor` | 启动 | `t0_epoch_ms, t0_hr, node, pid, page_bytes, mem_size_pages, maxmem_pages, cpus` |
+| `msm_plan` | `_multiExp` 入口 | `call_id, site, group, n_points, s_scalar, s_g, in_type, bit_chunk, n_bit, chunk_size, n_point_chunk` |
+| `batch_plan` | `batchConvert` 入口 | `call_id, site, n_points, s_in, s_out, n_chunks` |
+| `fft_plan` | `_fft` 入口 | `call_id, site, n_points, bits, points_in_chunk, n_chunks, inverse` |
+| `fftjoinext_plan` | `_fftJoinExt` 入口 | `call_id, site, n_points, s_in, s_mid, s_out, chunk_size, fn` |
+| `fft_assembly` | `_fft` 末尾 | `call_id, site, copy_bytes, chunks_bytes, out_bytes` |
+| `task_send` | `postAction`（入队时） | `task_id, call_id, worker, site, kind, t_send_ms, clone_buffer_bytes, wasm_alloc_bytes, worker_output_bytes, cmd_count` |
+| `worker_task` | worker `runTask` 末尾 | `task_id, call_id, worker, alloc_base, wasm_before, wasm_after, alloc_top, allocs[], grow_events[], allocset_bytes, set_bytes, get_bytes, out_bytes, cmd_count, t_hr_start, t_hr_end, w_heap_used, w_external, w_array_buffers` |
+| `task_done` | `getOnMsg` | `task_id, call_id, worker, svc_ms` |
+| `heap_sample` | 主线程固定间隔 | `rss, heap_used, heap_total, external, array_buffers` |
+| `summary` | 进程退出 | `tasks, calls, batches_written, dropped` |
 
-`allocs[]` / `grow_events[]` 是 A.2 新增的两个字段，作用是让 L2 能**精确回放**而不需要任何容差：
+`allocs[]` / `grow_events[]` 让 L2 能**精确回放**而不需要任何容差：
 
-- `allocs[]`：按命令顺序列出本任务每个 `ALLOC` / `ALLOCSET` 的字节数（`len` 或 `buff.byteLength`）。
-  MSM 任务是 `[bases, scalars, jac]`，batchconvert 是 `[n·sIn, n·sOut]`，FFT mix 是 `[sMid·pts]`。长度 ≤ 6，追加成本可忽略。
-- `grow_events[]`：`[{at_alloc: i, from_pages, to_pages}]`，在 `alloc()` 内部记录 `memory.grow` 的实际前后页数。
-- 二者加 `alloc_base` 与 `wasm_before`，即可从 `alloc_base` 起逐条重放，**页数必须逐一相等**（§7.6 L2）。
+- `allocs[]`：按命令顺序列出本任务每个 `ALLOC` / `ALLOCSET` 的字节数。MSM 是 `[bases, scalars, jac]`，
+  batchconvert 是 `[n·sIn, n·sOut]`，FFT mix 是 `[sMid·pts]`，FFT join 是 `[pts·sMid, pts·sMid, 32, 32]`。长度 ≤ 6。
+- `grow_events[]`：`[{at_alloc, len, from_pages, to_pages, top, t_hr}]`，在 `alloc()` 内部记录。
+  `t_hr` 是 M5-E.1 加的：它是**真实的**扩容时刻，而不是"主线程收到任务回复"的时刻（两者相差可达 700 MiB 的容量）。
+- `alloc_base` 与 `wasm_before` 加上 `allocs[]`，即可从底座起逐条重放，**页数必须逐一相等**（§7.6 L2）。
 
-字段口径（四条，容易搞错）：
+字段口径（五条，全部踩过）：
 
-- `wasm_bytes` 是**容量**（`memory.buffer.byteLength`），不是驻留字节，**不能与 WS 相加**。
-- 主线程 `arrayBuffers` 已含在 `external` 内，**不可累计**；`rss` 是整进程值（含所有 Worker）。
-  Worker 只上报本 isolate 的堆字段，进程级 RSS 只由主线程采一次。
-- `send_bytes` 是**单份**逻辑载荷；序列化副本与反序列化副本是同一载荷的两个瞬间，只记一次，用 `inflight` 描述重叠。
-- `alloc_base` 用来**推翻或确认 HYP-1**：每个 Worker 在 `INIT` 之后只读一次。
+1. `wasm_bytes` / `wasm_after` 是**容量**（`memory.buffer.byteLength`），不是驻留字节，**不能与 WS 相加**。
+2. 主线程 `arrayBuffers` 已含在 `external` 内，**不可累计**；`rss` 是整进程值（含所有 Worker）。
+3. **三种字节量必须分开**：`clone_buffer_bytes`（`ALLOCSET + SET`，真正跨线程的缓冲区）、
+   `wasm_alloc_bytes`（`ALLOCSET + ALLOC`，Worker 线性内存里的预留）、`worker_output_bytes`（`GET` 请求，
+   真实副本是 `out_bytes`）。M5-E 之前把它们加成一个 `send_bytes`，使 batch 路径虚高 3.0×、FFT 虚高 2.2×。
+   `wasm_alloc_bytes` 必须等于 `sum(allocs)`——两者由独立代码路径产生，L2 用它做交叉校验。
+4. `alloc_base` 用来**推翻或确认 HYP-1**：实测 102,328 B，且每个 Worker 的每个任务都相同（L2 断言）。
+5. 时间戳：主线程用 `process.hrtime.bigint() - t0hr`；Worker 用**同一个** `process.hrtime.bigint()`
+   （跨线程同源），相对原点由 `anchor.t0_hr` 给出。这是 `grow_events[].t_hr` 能与 WS 采样对齐的前提。
 
 ### 7.5 采样纪律
 
 - 事件按任务/计划粒度触发，**不在分配循环里打点**；禁止 `Uint8Array.prototype.slice` 全局劫持、
   每秒级 `Object.keys` 扫描、在 `alloc()` 内写日志（M4 教训：O(pages) 探针让 p16 从 10 s 变 18 s）。
+- 唯一的例外是 `alloc()` 里的 `hrtime.bigint()`：它只在**真要扩容的分支**里取一次（p18 全程 180 次），
+  不做字符串拼接、不写盘，事件对象由 `runTask` 结束时统一上报。这一条是 M5-E.1 为拿到真实 grow 时刻而加的。
 - 主线程缓存数组，每 256 条或 250 ms 落盘；`process.on('exit')` 兜底 flush。
 
 ### 7.6 验收门槛（三层，替代原 70%–100% 区间）
@@ -667,22 +685,24 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 | 问题 | 回答它的字段 | 判定 |
 | --- | --- | --- |
 | RQ1 FFT 输入副本与分片是否峰值主要贡献者 | `fft_plan.copy_bytes`、`fft_assembly.*` | 与 MSM 在途同图；H-C |
-| RQ2 MSM 分片与 Worker 克隆同时存活多少 | `task_send.send_bytes` + `inflight` 时间序列 | 在途峰对 969 MiB；H-A |
+| RQ2 MSM 分片与 Worker 克隆同时存活多少 | `task_send.clone_buffer_bytes`（+ `wasm_alloc_bytes` 作对照）+ `inflight` 时间序列 | 双窗口：worker 窗口 932.6 / post 窗口 987.4 MiB；H-A |
 | RQ3 各 Worker WASM 是否持续增长并保留 | `worker_task.wasm_before/after/grow_pages/alloc_base` | L2 逐 Worker 对账；H-B |
-| RQ4 p18 tauG1 的 +2.2 GiB 由什么解释 | 上述三者**同刻并列** + `heap_sample.array_buffers` + 残差区间 | L3 残差区间，不设百分比门、不相加 |
+| RQ4 p18 tauG1 的 +2.2 GiB 由什么解释 | 四量**同刻并列**（在途 / C(t) / C(final) / WS）+ `heap_sample.array_buffers` + 结束下界 | L3 只给结束下界，不估峰值残差、不相加、不加百分比门 |
 
 ---
 
 ## 10. 风险与未解释项
 
-1. **模型不是测量**。§5 所有数字是"源码算术 + `alloc_base = 0`"，只有 §8 跑完才有结论权。
-2. **初始 allocator 基址未知**（F20）。它是 **HYP-1 下界**的来源：真实基址只会抬高 `requiredPages`，
-   不会降低；M5-B 用 `alloc_base` + 逐条回放替换它。
+1. ~~模型不是测量~~ **（已退役）**：§5 的所有数字现在都由 §8 的探针逐项核对过，`alloc_base` 用实测值。
+   仍成立的部分只有一句：§5 的页数来自源码算术，结论权在 L1/L2，不在本文件的表格。
+2. ~~初始 allocator 基址未知~~ **（HYP-1 已退役）**：实测 **102,328 B**，每个 Worker 的每个任务都相同
+   （L2 现在把"同一 Worker 上 `alloc_base` 恒定"作为断言）。基址取 0 会让页数差 1–2 页，而页数是 L2 的判据。
 3. **容量归属不再"依赖调度顺序"**（A.2 之后的补证，见 §5.0.1）：首轮映射由 `processWorks()` 的顺序扫描决定，
    迟到任务对 p16/p18 的 445 次调用逐一证明无增长，所以 1455 MiB 是**条件于点预测**而非上界；
    它唯一的不确定性来自 `alloc_base`。若探针发现首轮映射不是 `0..C-1`，说明 F8 的读法错了，须重做 §5。
 4. **V8 的 ArrayBuffer 回收不可观测**：`arrayBuffers` 只给当前持有量，给不出释放时刻。
-5. **WASM 容量 ≠ 驻留**：扩容但未写满的页可能不在 WS 里，H-B 只能证明"容量增长"。
+5. **WASM 容量 ≠ 驻留**：扩容但未写满的页可能不在 WS 里。因此 `WS − C` 可以为负
+   （p18 结束时刻就不是），只有在 WS 明显大于 C 时才给出有意义的**下界**；H-B 只能证明"容量增长"。
 6. **`prepare_phase2` 的 920–1180 MiB 差额目前无法归属**，可能是未统计的缓冲、Worker 内存或外部内存；
    在 M5-D 之前不得称其为"碎片"。
 7. **Windows 口径**：继续用 `PeakWorkingSet64` / `PeakPagedMemorySize64`，不引入新口径。
@@ -701,6 +721,25 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 12. **主线程 64 MiB 同时存活是假设 P-1，不是源码推论**：`BigBuffer.PAGE_SIZE = 1 GiB`，16 MiB 缓冲只占一页，
     `slice()` 走 `Uint8Array.slice` 必然复制（累计 16 MiB/次）；但输入 / 分片 / GET 结果 / 输出四者
     **是否同时存活**取决于 V8 回收时机，M5-D 用 `heap_sample.array_buffers` 判定。
+13. **三种字节量必须分开记，禁止再加成一个 `send_bytes`**：`clone_buffer_bytes`（`ALLOCSET + SET`）、
+    `wasm_alloc_bytes`（`ALLOCSET + ALLOC`）、`worker_output_bytes`（`GET`）。M5-E 之前把四类命令长度
+    加在一起，MSM 每任务多算一个 Jacobian（144/288 B，在 987.4 MiB 上不可见），
+    batch 路径虚高 **3.0×**、FFT 虚高 **2.2×**。`wasm_alloc_bytes == sum(allocs)` 已进 L2 作为硬门
+    （20,145 / 16,582 全部相等），因为这两者由完全独立的代码路径产生。
+14. **`memory.grow` 的时间戳必须记在 `alloc()` 里，不能记在任务完成时**：M5-E 把 grow 记在
+    `worker_task` 到达主线程的时刻，于是"在途峰时容量只有 778.3 MiB"——比真实值低 **706 MiB**，
+    并由此得出"两者不同时在场"的错误结论。真实值是在途峰那一刻 `C = 1,484.4 MiB`（p18，终值的 93.9%）。
+    **凡是"某时刻的容量"都必须用 `grow_events[].t_hr`，不能用任务完成顺序推。**
+15. **"结束"不等于"最后一个采样点"**：snarkjs 在 `prepared_verify` 返回后销毁 ThreadManager，
+    采样器还会继续轮询 200–300 ms，期间 WS 从 2,714 掉到 207 MiB。任何"运行结束时"的量都必须
+    以**最后一个任务完成**为界，不能用 `series` 的末元素。
+16. **`patches/m5-instrumentation.patch` 的头部带着本机绝对路径，不可移植**：`git diff --no-index`
+    会把临时副本与 checkout 路径写进 `diff --git` / `---` / `+++` 三行（还带本机用户名），
+    别处 `git apply` 必然失败。**但本轮不能改**：每份 trace 的 `provenance` 事件里记了
+    `patch_sha256 = 9af8019c…` 与 `manifest_sha256 = be16303a…`，跑完再动这些字节会让"记录 ←→ 产物"
+    的绑定断掉。归一化留到测量活动结束后单独提交（届时 patch/manifest 的 sha 会变，需要在文末注明）。
+    同理，`M5_MANIFEST.json` 里的 `generated_utc` 让 manifest 哈希**每次重建都不同**，它不是内容指纹，
+    可复现的是 `sha256_after` 与 `sha256_runtime` 两个字段。
 
 ---
 
@@ -713,7 +752,7 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 | 账目 D：记录但不计入本次峰值增量 | **接受**，但改称"独立冷启动容量预算"，并给出"本次 grow 次数 = 0" | §5.4、§10.10 |
 | 撤回"模型是上界" | **接受**，最终措辞为"现有测量尚不能验证静态模型的准确性"；不再用"噪声大于信号" | §5.6、§10.11 |
 | L2 无容差精确回放 | **接受，作为 M5-B 硬门**：从真实 `alloc_base` 起按事件顺序回放，页数逐一相等，首个不符点定位到 `(worker, task_id, alloc_index)` | §7.6 |
-| §5.6.1 Worker 分布与容量增量 | **已按源码更正**：18@988 + 10@549；tauG2 `Δ池 = 18×55 + 494 = 1,484 页 = 92.75 MiB` | §5.6.1 |
+| §5.6.1 Worker 分布与容量增量 | **A.2 当时按源码更正为 18@988 + 10@549；M5-C 实测再更正为 19@989 + 9@551**（内层 bit-chunk 按分片点数重算，§5.3 错项 2）。tauG2 Δ池 = 19×55 + 493 = 1,538 页 = 96.1 MiB，A.2 写的 1,484 页 = 92.75 MiB 已作废 | §5.3、§5.6.1 |
 | 计算器须覆盖 G1/G2 与全部 power | **已补齐**：`--operation plan` 输出 445 次调用（p18）的完整计划，含 group / power / 切分 / 首轮页数 | `scripts/m5_budget.cjs` |
 | `queueAction` 须显式上下文绑定 | **M5-B 实现**（见下） | §7.3 已改为逐调用点传 ctx |
 
@@ -741,11 +780,11 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 
 | 组件 | 文件 | 状态 |
 | --- | --- | --- |
-| vendor 副本 + 24 处断言式补丁 | `scripts/m5_build_vendor.cjs` → `vendor/ffjavascript-0.3.1-m5/`、`patches/m5-instrumentation.patch`、`M5_MANIFEST.json` | 完成（`sha256 40128293… → efd3ed81…`，patch 14,097 B） |
+| vendor 副本 + 24 处断言式补丁 | `scripts/m5_build_vendor.cjs` → `vendor/ffjavascript-0.3.1-m5/`、`patches/m5-instrumentation.patch`、`M5_MANIFEST.json` | 完成（v1 `40128293… → efd3ed81…`；v2/M5-E.1 `→ 03023109…`，patch 14,903 B / sha `9af8019c…`） |
 | `--require` 重定向 + 自证 | `scripts/m5_hook.cjs` | 完成（Worker 线程早退；`resolve` 非 vendor 即 `exit(3)`） |
 | 三模式驱动 | `scripts/measure_m5.ps1 -Mode pristine\|vendor\|trace` | 完成（委托 `measure_snarkjs.ps1`，Windows 口径与 M4.1 一致） |
-| L1 门槛 | `scripts/m5_check_l1.cjs` | **p10 PASS（237/237）** |
-| L2 门槛 | `scripts/m5_check_l2.cjs` | **p10 PASS（10,084 任务 / 28 Worker / 0 fails）** |
+| L1 门槛 | `scripts/m5_check_l1.cjs` | **p10 / p16 / p18 全 PASS**（237 / 360 / 445 次调用；`site` 100% 比对，`group`/`s_g` 只在 MSM 上可比） |
+| L2 门槛 | `scripts/m5_check_l2.cjs` | **全 PASS**（10,084 / 16,582 / 20,145 任务，0 fails，28 条容量历史链，字节交叉校验 100%） |
 | 静态账本 | `scripts/m5_budget.cjs --operation plan\|segments\|phase1` | 完成（顺序逐 Worker 池模型；G1/G2 与所有实际执行的 power 全覆盖） |
 
 - **M5-C**：p10 smoke 过 L1 / L2（已达成）+ 三模式扰动预算（`pristine` vs `vendor` vs `trace` 的 peak WS 与耗时偏差）。
@@ -753,10 +792,19 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
   逐 Worker 归因与同刻残差由 `scripts/m5d_attribution.cjs` 生成
   （`results/processed/m5d_attribution_p1{6,8}_r{1,2,3}.{md,csv}`）。L1/L2 在 360/445 次调用、
   16,582/20,145 个任务上全部通过。
-- **M5-E（已完成）**：`docs/M5_ATTRIBUTION.md`。在途峰 987.4 / 265.1 MiB 与容量终值 1,580.5 / 426.6 MiB
-  与静态账本**逐项相等**，但两者不同时成立；在途峰时刻的残差区间 **[692, 1,603] MiB**，
-  结束残差下界 **0.85 / 0.79 GiB** 且三次运行之间相差约 600 MiB，**不归给任何单一机制**。
-  优化代码仍不写——残差未拆开之前，任何改动的收益都无法归因。
+- ~~M5-E~~ **（结论已被 M5-E.1 修正，保留作历史）**：在途峰 987.4 / 265.1 MiB 与容量终值 1,580.5 / 426.6 MiB
+  确实与静态账本逐项相等；但"两者不同时成立"是**错的**（见下）。
+- **M5-E.1（已完成）**：三处修正 + 一次重跑，`docs/M5_ATTRIBUTION.md` 已整体重写。
+  1. `payloadBytes()` 拆成 `clone_buffer_bytes` / `wasm_alloc_bytes` / `worker_output_bytes`；
+     旧口径使 batch 虚高 3.0×、FFT 虚高 2.2×。
+  2. `grow_events[]` 增加 `t_hr`（`alloc()` 内取），`anchor` 增加 `t0_hr`，任务增加 `t_hr_start/end`。
+     容量因此是精确阶梯函数：在途峰那一刻 **C = 1,484.4 / 404.4 MiB**（终值的 93.9% / 94.8%），
+     **在途与容量同时到顶**。
+  3. 峰值时刻不再计算残差，只同刻并列；结束残差只在 `in-flight = 0` 的时刻计算，
+     下界 **829–1,184 / 1,111–1,218 MiB**，且以"最后一个任务完成"为界（之后是 teardown）。
+  4. L1 增加 `site`/`group`/`s_g` 与 FFT 任务数；L2 增加逐 Worker 容量历史连续性与 `len`/`top` 对账。
+  5. 离线重算脚本 `scripts/m5e_inflight.cjs` 可在 M5-D 的旧日志上直接跑，不需要重跑实验。
+  优化代码仍不写：残差没有拆开之前，任何改动的收益都无法归因。
 
 > **边界声明**：A.2 是本项目**最后一次静态设计校准**（本轮只做了评审勘误，不构成新修订）。此后不再靠纸面
 > 预算推导内存峰值——所有数字要么来自探针，要么明确标注为"边界假设"。

@@ -4259,6 +4259,13 @@ function thread(self) {
     // so the switch and the recorder live inline. Off => zero behaviour change.
     const M5_ON = (typeof process !== "undefined") && process.env && process.env.M5_TRACE === "1";
     let M5_CUR = null;
+    // M5-E.1: memory.grow() happens *inside* the task, but the main thread only
+    // learns about it when postMessage arrives. hrtime.bigint() is a single
+    // process-wide monotonic clock shared by every worker thread, so recording it
+    // here lets the analyser put the grow on the same axis as main-thread events
+    // (the origin is published once, in the "anchor" event).
+    const M5_HR = (M5_ON && typeof process !== "undefined" && process.hrtime)
+        ? function () { return String(process.hrtime.bigint()); } : null;
 
     if (self) {
         self.onmessage = function(e) {
@@ -4314,7 +4321,8 @@ function thread(self) {
             let requiredPages = Math.floor((u32[0] + length) / 0x10000)+1;
             if (requiredPages>MAXMEM) requiredPages=MAXMEM;
             if (M5_CUR) M5_CUR.grow_events.push({at_alloc: m5idx, len: length,
-                from_pages: currentPages, to_pages: requiredPages, top: u32[0]});
+                from_pages: currentPages, to_pages: requiredPages, top: u32[0],
+                t_hr: M5_HR ? M5_HR() : null});
             memory.grow(requiredPages-currentPages);
         }
         return res;
@@ -4348,7 +4356,7 @@ function thread(self) {
         const oldAlloc = u32a[0];
         const m5 = M5_ON ? { alloc_base: oldAlloc, wasm_before: memory.buffer.byteLength,
             allocs: [], grow_events: [], allocset_bytes: 0, set_bytes: 0, get_bytes: 0,
-            cmd_count: task.length } : null;
+            cmd_count: task.length, t_hr_start: M5_HR ? M5_HR() : null } : null;
         M5_CUR = m5;
         for (let i=0; i<task.length; i++) {
             switch (task[i].cmd) {
@@ -4397,6 +4405,8 @@ function thread(self) {
                 m5.heap_used = mu.heapUsed; m5.external = mu.external; m5.array_buffers = mu.arrayBuffers;
             }
             m5.call_id = m5ctx ? m5ctx.call_id : 0;
+            m5.t_hr_end = M5_HR ? M5_HR() : null;
+            m5.task_id = m5ctx && m5ctx.task_id !== undefined ? m5ctx.task_id : null;
             m5out = { __m5: m5, out: ctx.out };
         } else {
             u32b[0] = oldAlloc;
@@ -5045,7 +5055,8 @@ function buildMultiexp(curve, groupName) {
         if (chunkSize<MIN_CHUNK_SIZE) chunkSize = MIN_CHUNK_SIZE;
 
         const m5c = (M5 && M5.on) ? M5.plan('msm', logText || 'msm', {group: groupName,
-            n_points: nPoints, s_scalar: sScalar, bit_chunk: bitChunkSize, n_bit: nChunks,
+            n_points: nPoints, s_scalar: sScalar, s_g: sGIn, in_type: inType,
+            bit_chunk: bitChunkSize, n_bit: nChunks,
             chunk_size: chunkSize, n_point_chunk: Math.ceil(nPoints / chunkSize)}) : null;
         const opPromises = [];
         for (let i=0; i<nPoints; i += chunkSize) {

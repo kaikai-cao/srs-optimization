@@ -1,13 +1,13 @@
 {
   "experiment": "M5-B",
-  "generated_utc": "2026-11-09T02:56:13.249Z",
+  "generated_utc": "2026-11-09T08:41:24.315Z",
   "source": "node_modules/ffjavascript@0.3.1",
   "dest": "vendor/ffjavascript-0.3.1-m5",
   "target_file": "build/main.cjs",
   "why_bundle": "package.json exports[\".\"].node.require -> ./build/main.cjs; thread.toString() is taken from this bundle",
   "sha256_before": "40128293f4c64cc614f65fd6e670a955c4af7787a15d95b49ec058a02625dd01",
-  "sha256_after": "efd3ed81d15596c517e12eb09ce1530b6a08270d74501e4d2af689d0d0ddb5db",
-  "sha256_runtime": "fa6960a8b30196b7491ab115c589a583430ee7a2925fcca06a45aeb33188371b",
+  "sha256_after": "0302310960b09c13eb831daa953b8bec46f59adaf868c733939ea994e638ba6d",
+  "sha256_runtime": "b418cda64c4e752eca54ce1284a3fa71a29f265e50add24f441549f56ea79cf0",
   "patches_applied": [
     "P1 runtime require",
     "P2 worker: M5 constants + task recorder",

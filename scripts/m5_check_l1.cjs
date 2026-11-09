@@ -12,6 +12,17 @@
  * deterministically. Any difference means either the probe missed a call, or our
  * reading of the source is wrong -- both are fatal for attribution.
  *
+ * M5-E.1 additions (review finding #4):
+ *   - `site` is compared through the plan's `probe_site` mapping. M5-E attributes
+ *     the in-flight peak to `tauG1_19_transformed` on the strength of `site`, so a
+ *     correct geometry with a swapped group or section label must NOT pass.
+ *   - `group` and `s_g` are compared where the probe reports them, which is what
+ *     actually catches a G1/G2 swap (same byte counts only when 96 == 192, i.e.
+ *     never -- but a section swap keeps both).
+ *   - fft / fftjoinext now take part in the task-count comparison. The plan models
+ *     the join levels (nChunks/2 per level), so there is no longer any reason to
+ *     exempt them.
+ *
  * Usage:
  *   node scripts/m5_check_l1.cjs --plan results/raw/m5_plan_p18.json \
  *                                --jsonl results/raw/m5_p18_r1.jsonl
@@ -79,6 +90,7 @@ function main() {
 
   const expected = plan.calls;
   const problems = [];
+  const compared = { site: 0, group: 0, s_g: 0 };
 
   if (calls.length !== expected.length) {
     problems.push(`call count: expected ${expected.length}, observed ${calls.length}`);
@@ -102,8 +114,28 @@ function main() {
         problems.push(`#${i} ${e.kind} ${e.site}: ${ek} expected ${ev}, observed ${ov}`);
       }
     }
-    // task count is only comparable where one call == one wave of tasks
-    if (e.kind !== 'fft' && e.kind !== 'fftjoinext') {
+    // --- site / group / s_g: the identity of the call, not just its shape ---
+    if (e.probe_site !== undefined && e.probe_site !== null) {
+      compared.site += 1;
+      if (o.site !== e.probe_site) {
+        problems.push(`#${i} ${e.kind}: site expected '${e.probe_site}' (plan '${e.site}'), observed '${o.site}'`);
+      }
+    }
+    if (e.group !== undefined && e.group !== null && o.group !== undefined && o.group !== null) {
+      compared.group += 1;
+      if (o.group !== e.group) {
+        problems.push(`#${i} ${e.kind} ${e.site}: group expected ${e.group}, observed ${o.group}`);
+      }
+    }
+    if (e.s_g !== undefined && e.s_g !== null && o.s_g !== undefined && o.s_g !== null) {
+      compared.s_g += 1;
+      if (o.s_g !== e.s_g) {
+        problems.push(`#${i} ${e.kind} ${e.site}: s_g expected ${e.s_g}, observed ${o.s_g}`);
+      }
+    }
+
+    // --- task count: every kind, including fft join levels ---
+    {
       const observed = sendsByCall.get(o.call_id) || 0;
       if (observed !== e.n_tasks) {
         problems.push(`#${i} ${e.kind} ${e.site}: tasks expected ${e.n_tasks}, observed ${observed} (call_id ${o.call_id})`);
@@ -123,6 +155,11 @@ function main() {
   console.log(`calls    : expected ${expected.length}, observed ${calls.length}`);
   console.log(`tasks    : ${sends.length} task_send (${unlabeled} unlabeled, ${sends.length - unlabeled} attributed)`);
   console.log(`kinds    : ${[...seenKinds].sort().join(', ')}`);
+  console.log(`identity : site ${compared.site}/${n}, group ${compared.group}/${n}, s_g ${compared.s_g}/${n} compared`);
+
+  if (compared.site !== n) {
+    problems.push(`identity: only ${compared.site}/${n} calls had a probe_site mapping -- the site check is incomplete`);
+  }
 
   if (problems.length) {
     console.log(`\nL1 FAIL (${problems.length} problem(s)):`);

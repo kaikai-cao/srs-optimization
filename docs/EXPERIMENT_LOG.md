@@ -892,6 +892,11 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 
 ## M5-E｜归因报告：两个状态量精确命中，"同时在场"不成立（2026-11-09）
 
+> **本节标题已被 M5-E.1 撤回**，保留原文仅为留痕。作废的是三处：`send_bytes` 的口径（MSM 差一个 Jacobian，
+> 不能称"精确命中"）、"同时在场不成立"这句判断（grow 时间戳记在任务完成时，当时并没有真实时间戳），
+> 以及峰值时刻的残差（§10.9 禁止在该时刻做减法）。仍成立的是容量池模型与逐 Worker 分布。
+> 现行结论见下方 **M5-E.1** 条目与 `docs/M5_ATTRIBUTION.md`。
+
 - **文档**：`docs/M5_ATTRIBUTION.md`。分析器 `scripts/m5d_attribution.cjs` 把四个量放到同一时钟上
   （在途 / 容量 / Worker JS 堆 / WS），残差以**区间**给出。
 - **精确相等的两项**：
@@ -910,3 +915,51 @@ Power 16 / 18 的贡献文件由本轮生成（`-e` 熵不保证文件哈希可�
 - **没做的事**：不写优化代码、不改依赖、不跑 p20/p21、`m1-m2-frozen` 未动。
 - **下一步（若要继续）**：把 `grow_events` 的时间戳下移到 alloc 内部（收紧"容量何时可见"）；
   用 `-HeapSampleMs` 采 `heap_sample.array_buffers`，把结束残差拆成主线程缓冲 / FastFile 页池 / V8 未回收。
+
+---
+
+## M5-E.1｜口径修正与时间戳补强：一个结论被推翻（2026-11-09）
+
+- **触发**：M5-E 评审指出三处问题，其中两处会直接影响结论：①`send_bytes` 把 `ALLOC`/`GET` 也算成"发送"；
+  ②`memory.grow` 的时间戳记在任务完成时，因此"在途峰时容量只有 778.3 MiB"是"主线程已收到报告"的容量，
+  不是真实容量。评审要求先修口径再谈优化。
+- **P0-1 三种字节量拆开**：`payloadBytes()` 不再返回一个数，而是
+  `{clone: ALLOCSET+SET, alloc: ALLOCSET+ALLOC, get: GET}`；`task_send` 改发
+  `clone_buffer_bytes / wasm_alloc_bytes / worker_output_bytes`。`wasm_alloc_bytes` 必须把 `ALLOCSET` 算进去，
+  因为 `allocBuffer()` = `alloc(byteLength)` + `setBuffer()` —— 这一步最初漏了，被 L2 的交叉校验当场抓出
+  （`task_send.wasm_alloc_bytes 21312 != sum(allocs) 21744`，差 432 = 两个 `ALLOCSET`）。
+- **量级**（p18 全程按任务累加）：MSM 9,960.6 vs 旧 9,964.4（1.00×，只差一个 Jacobian，所以在 987.4 MiB 上看不出）；
+  batch 304 vs 912（**3.00×**）；FFT 480.2 vs 1,040.1（**2.17×**）。
+- **P0-2 grow 时间戳**：`M5_HR = () => String(process.hrtime.bigint())` 内联进 worker，
+  `grow_events[]` 增 `t_hr`，`anchor` 增 `t0_hr`，任务增 `t_hr_start/t_hr_end`。`hrtime.bigint()` 跨 worker 线程同源，
+  所以三条时间线可以放在一根轴上。
+  - **在 `alloc()` 里只取时间戳、不拼字符串、不写盘**；p18 全程只有 180 次。
+  - 容量因此变成精确阶梯函数 `C(t) = 700 页 + Σ{grow : t_grow ≤ t}`。
+- **结论被推翻**：在途峰（p18 t=21.7 s）那一刻 `C = 1,484.4 MiB`，是终值 1,580.5 的 **93.9%**（p16：404.4 / 426.6 = 94.8%）。
+  **在途与容量确实同时到顶**。M5-E 的 778.3 MiB 比真实值低 **706 MiB**，它统计的是"已完成任务的增长"。
+  "把两者相加当峰值预测"这个禁令仍然有效，但理由不是"不同时"，而是它们在峰值时刻同时处于高位。
+- **P1 残差口径**：峰值时刻不再算残差，只同刻并列。结束残差只在 `in-flight = 0` 的时刻算，且"结束"必须
+  以**最后一个任务完成**为界——snarkjs 返回后 ThreadManager 被销毁，采样器还会轮询 200–300 ms，
+  WS 从 2,714 掉到 207 MiB，用 `series` 末元素会得到负残差。修正后 `WS(end) − C(final)` =
+  p18 **829 / 957 / 1,184 MiB**、p16 **1,111 / 1,147 / 1,218 MiB**。
+- **P1 门槛补强**：
+  - L1 增加 `site`（经 plan 的 `probe_site` 映射）、`group`、`s_g`。旧 L1 不比 `site`，
+    而 M5-E 的"在途峰 100% 来自 `tauG1_19_transformed`"完全依赖 `site` —— 这是一个真实的盲区。
+  - 把 FFT 纳入任务数比对之前先手工对了一遍，发现计算器的 `fftTasks()` 只算了 mix 阶段，
+    任务数少 2–4 倍（p8：32 vs 112，p10：32 vs 112）。按 `nChunks + (bits-l2Chunk)×nChunks/2` 补上后
+    不再需要把 fft/fftjoinext 排除在 H2 之外，445/445 全对。
+  - L2 增加逐 Worker **容量历史连续性**（`wasm_after(k) == wasm_before(k+1)`，28 条链全成立）、
+    `alloc_base` 恒定、`grow_events[].len/top` 对账，以及
+    `clone_buffer_bytes == allocset+set` 与 `wasm_alloc_bytes == sum(allocs)` 的双向交叉校验。
+- **P2 清理**：删除 `m5_budget.cjs --json` 里调用已移除函数的旧分支（改为从 plan 派生）；
+  删除死代码 `msmCall()`；`replayWorkerMemory()` 的基址由 0 改为实测 102,328 B（`ALLOC_BASE_MEASURED`）；
+  删除 `scripts/m5d_attribution.cjs`（它的在途定义与容量时间线都错，由 `m5e_attribution.cjs` 取代）。
+- **重跑**：p16 / p18 各 3 对交错（`results/raw/m5e/`），探针事件 50,178 / 60,960。
+  L1 360/360、445/445；L2 16,582 / 20,145 任务、110 / 180 次 grow、0 fails；字节交叉校验 100%。
+  p10 三模式各 5 次重测：`+2.3%`（换 bundle）/ `+8.9%`（写 JSONL），peak WS 仍不可分辨。
+- **新增脚本**：`scripts/m5e_inflight.cjs`（在途离线重算，可直接跑 M5-D 旧日志，双窗口）、
+  `scripts/m5e_attribution.cjs`（三线同轴 + 精确 C(t) + 结束下界）。
+- **降级**：FFT 从"已排除为主因"改为"Worker 消息缓冲比 MSM 小两个数量级，但主线程副本与驻留生命周期未归因"。
+- **没做的事**：不写优化代码、不改依赖、不跑 p20/p21、`m1-m2-frozen` 未动。
+- **下一步**：残差仍未拆开。要拆它需要 `-HeapSampleMs` 时间序列 + 主线程 `array_buffers` 的寿命归因，
+  而不是继续在静态模型上迭代。
