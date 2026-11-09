@@ -55,7 +55,11 @@ param(
 
     [int]$HeapSampleMs = 0,
 
-    [string]$NodeExe = ''
+    [string]$NodeExe = '',
+
+    # Appended to the run label so that interleaved A/B invocations of the same
+    # mode do not overwrite each other (each invocation restarts at r1).
+    [string]$RunTag = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,7 +86,7 @@ $prefix = "m5_$Mode"
 Write-Output ("=== M5: operation=$Operation power=$Power mode=$Mode repeats=$Repeats ===")
 
 for ($i = 1; $i -le $Repeats; $i++) {
-    $label = "${prefix}_${Operation}_p${Power}_r${i}"
+    $label = "${prefix}_${Operation}_p${Power}_r${i}${RunTag}"
     $jsonl = Join-Path $resultsFull "$label.jsonl"
     $cfgPath = Join-Path $resultsFull "$label.config.json"
 

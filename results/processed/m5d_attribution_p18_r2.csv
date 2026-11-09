@@ -1,0 +1,4 @@
+checkpoint,t_ms,inflight_mib,capacity_mib,ws_before_mib,ws_after_mib,residual_min_mib,residual_max_mib
+before first task,7548.8,0.0,43.8,439.9,439.9,396.1,396.1
+in-flight peak,28511.3,987.4,778.3,3260.1,3304.2,1494.4,1538.5
+end of run,58669.0,0.0,1580.5,3032.6,2977.4,1396.9,1452.1
