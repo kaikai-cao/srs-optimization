@@ -1,6 +1,6 @@
-# M5 内存归因：探针设计与源码分配路径审计（M5-A.1）
+# M5 内存归因：探针设计与源码分配路径审计（M5-A.2）
 
-- **状态**：A.1 修订稿（评审稿）。评审通过后才进入 M5-B 实现。
+- **状态**：A.2 修订稿（评审稿）。评审通过后才进入 M5-B 实现。
 - **分支**：`experiment/m5-attribution`（未合入 `main`）。
 - **基线**：`main @ 24a0dd3`；`ffjavascript 0.3.1`、`snarkjs 0.7.6`、`Node v22.22.2`、Windows、28 逻辑核。
 - **本文件不含**：任何依赖改动、任何计算逻辑改动、任何新的实验数据。
@@ -17,16 +17,29 @@
 | --- | --- | --- | --- |
 | 1 | 把 `tauG1` 的 MSM 当成一条 32 B 标量账目 | **拆成三条**：`processSection`（4 B）、`resTau`（4 B）、`resLagrange`（32 B） | `powersoftau_verify.js:361 / 425 / 454` |
 | 2 | Phase 1 存量 **223 MiB**（按 32 B、22 bit-chunk、2 point-chunk） | **72.4 MiB**（4 B、3 bit-chunk、10 point-chunk，G2 段把 Worker 扩到 42 页） | `:361` + `:112-137` |
-| 3 | "模型解释 98%，误差 2%" | **撤回**。改后模型段增量 2351 MiB 对实测 2160 MiB，**高出 8.9%**，仍属上界 | §5.5 |
-| 4 | 用"模型共存峰值"直接减"全程峰值" | **删除该比较**（不同相位不可比）。改为同窗口锚定：起始 current WS + 模型增量 | §5.5 |
+| 3 | "模型解释 98%，误差 2%" | **撤回**。改后模型段增量 2351 MiB 对实测 2160 MiB，**高出 8.9%** | §5.6（**"上界"身份已被 A.2 推翻**，见 §0.1 第 6 条） |
+| 4 | 用"模型共存峰值"直接减"全程峰值" | **删除该比较**（不同相位不可比）。改为同窗口锚定：起始 current WS + 模型增量 | §5.6 |
 | 5 | F14 写"p18 时 32 chunk × 8192 点" | **32 chunk × 16384 点**（`2^19/2^14`）；8192 是 `2^18` 的情形 | `engine_fft.js:13` |
 | 6 | MB 与 MiB 混用（16.8 / 50.3） | 全文统一 **MiB**；`2^19×32 = 16 MiB`、`2^19×96 = 48 MiB` | —— |
-| 7 | `prepare_phase2` 残差解释为"碎片/未释放" | 降级为**未解释残差**，不作机制断言 | §5.4、§10.6 |
+| 7 | `prepare_phase2` 残差解释为"碎片/未释放" | 降级为**未解释残差**，不作机制断言 | §5.5、§10.6 |
 | 8 | 验收门"探针值落在模型值 70%–100%" | **删除**。改为三层：切分逐字段相等 / 逐 Worker 页数对账 / 同刻四量对比 | §7.6 |
+
+### 0.1 A.2 修订对照（相对 `dd51f3e`）
+
+| # | A.1 稿 | A.2 稿 | 依据 |
+| --- | --- | --- | --- |
+| 1 | 账目只到 A（`processSection`）/ B（`resTau`）/ C（`resLagrange`） | **新增账目 D：`Fr.batchTo/FromMontgomery`**。p18 每个干净 Worker 被两次分配推到 **28 页**，28 个 Worker 合计 **49 MiB**；p16 不扩容 | `engine_batchconvert.js:23-32`；`wasm_field1.js:71` |
+| 2 | HYP-1 只写"基址取 0（未实测）" | 明确为**下界假设**：真实基址只会**抬高**容量，不会降低；不参与任何"预测"表述 | §5.0 |
+| 3 | HYP-2 以"大分片优先分配到不同 Worker"计算 | 明确**只用于构造上界，不代表实际调度顺序**；实际归属必须由 `worker_task.worker` 实测 | §5.0 |
+| 4 | L2 允许"基址偏移的整页差" | **删除容差**。改为按事件顺序**逐 Worker 精确回放**，页数必须**逐一相等** | §7.6 |
+| 5 | 同窗绝对量 `776 + 2351 = 3127` 对实测 2936，称 6.5% | **删除该相加比较**。在途字节 / WASM 容量 / Working Set 三者量纲不同，**不得相加当 WS 预测**；改为同刻并列 + 显式残差 | §5.6、§10.9 |
+| 6 | 用**单次** `+2160 MiB` 代表"实测段增量"，并称模型"高出 8.9%、仍是上界" | **改为三次并列**：p18 `+2160/+2487/+2636`（均值 2428），p16 `+194/+207/+238`（均值 213）。p18 模型 0.97×（**低于**均值）、p16 2.8×（远高于），**方向相反 → "上界"不成立**；离散 ±10% 已大于模型偏差，**该比较不能判定模型对错** | §5.6；`m4_1_*_p1x_r{1,2,3}.json` 阶段标记 |
+| 7 | §5.1 只列 4 个 phase-1 section | 补 **`betaG2`**（1 点，`processSectionBetaG2` 读 192 B 后 `fromRprLEM`/`toRprUncompressed`，**无 MSM、无 Worker、无 WASM 分配**） | `powersoftau_verify.js:316-338` |
+| 8 | 未说明 phase 2 的四个 section 如何共享容量 | 补 M4.1 实测旁证：tauG1 段 +2160（r1）之后，tauG2/alphaTauG1/betaTauG1 只各 +266 / +230（r1），说明**容量被复用而非重新增长** | §5.6.1 |
 
 ---
 
-## 1. 结论摘要（给评审的 6 条）
+## 1. 结论摘要（给评审的 7 条）
 
 1. **must-fix 已修**：`snarkjs` 在三个地方喂不同宽度的标量——`processSection` 4 B、`resTau` 4 B、`resLagrange` 32 B。
    A 稿把 32 B 的位块放大（18 个 bit-chunk）套到了全部 MSM 上，导致 Phase 1 基线与"2% 吻合"两个结论都不成立。
@@ -36,12 +49,20 @@
 3. **Worker WASM 的双倍余量机制成立**（`alloc()` 把 `length` 加了两次），但**每个 Worker 的容量取决于它接过哪个分片**，
    所以"1455 MiB"是一个**上界**（按大分片优先分配），不是确定预测；真实值必须逐 Worker 读。
 4. **Phase 1 基线重算为 72.4 MiB**，驱动项不是 G1 而是 **G2 的 `tauG2` 段**（`65535×192×2 > 25 页` → 扩到 42 页）。
-   扣除后的模型段增量 = 969.1 +（1454.6 − 72.4）= **2351 MiB**，对实测 +2160 MiB **高出 8.9%**。
-5. **p16 上同一模型高出 3.0×**（591 MiB 对 194 MiB）。所以这个账本的身份仍是**上界**：p18 差 9%、p16 差 200%，
-   说明还有未被建模的项（或 Worker 容量远未写满）。**M5 的价值就在这里**。
+   扣除后的模型段增量 = 969.1 +（1454.6 − 72.4）= **2351 MiB**。
+5. **单次引用 +2160 MiB 不可靠，模型也不是统一上界**（A.2 新发现）：p18 三个 run 的 tauG1 段增量分别是
+   **+2160 / +2487 / +2636**（均值 2428，极差 476 = ±10%），模型 2351 落在区间内（0.97×）；
+   p16 三次是 **+194 / +207 / +238**（均值 213），模型 591.5 为 **2.8×**。
+   两个 power 的偏差方向相反，**所以"上界"这个身份也不成立**——三次实测的离散已经大于模型与实测的差，
+   这个比较**不能用来判定模型对错**（§5.6）。
 6. **原 H1（FFT 输入副本）在 `prepared_verify @ p18` 上只有约 48 MiB**（16 输入副本 + 16 分片 + 16 输出），
    相对 MSM 的 969 + 1455 可忽略；`prepare_phase2` 相反，FFT 才是主路径，但它与实测的残差目前**无法解释**，
    只能说"模型漏了东西"，不能断言是碎片。
+7. **账目 D（`Fr.batchTo/FromMontgomery`）此前漏记，现已补上**：每个 chunk 做**两次**分配
+   （`ALLOCSET` 599,168 B + `ALLOC` 599,168 B），在 25 页的干净 Worker 上触发 `memory.grow` →
+   **28 页/Worker**，28 个 Worker 合计 **49 MiB**。但它在同一次 `verifyPower` 里**晚于** `resTau`：
+   p18 时 `resTau` 已把 Worker 推到 165 页、p16 时推到 42 页，所以这一步**不改变高水位**（增量 0），
+   只影响**容量历史**与主线程的 48 MiB 瞬时副本。**它必须被记录，但不能被当成峰值贡献项。**
 
 ---
 
@@ -80,30 +101,33 @@
 
 ---
 
-## 3. 三条独立账目（A.1 的核心结构变更）
+## 3. 四条独立账目（A/B/C 按标量宽度分叉，D 是 batchconvert）
 
 | 账目 | 源码 | 标量宽度 | 点数 | 典型位块数（p18 最大迭代） | 何时发生 |
 | --- | --- | ---: | --- | ---: | --- |
-| **A 阶段 1** | `processSection`（`:340-396`） | **4 B** | 每分片 65536，MSM 用 `n-1` | **3** | Phase 1，四个 section |
+| **A 阶段 1** | `processSection`（`:340-396`） | **4 B** | 每分片 65536，MSM 用 `n-1` | **3** | Phase 1，四个 section（`betaG2` 另走 `:316-338`，无 MSM） |
 | **B `resTau`** | `verifyPower`（`:425-452`） | **4 B** | `2^p` | **3** | 每次 `verifyPower` 的第一步 |
-| **C `resLagrange`** | `verifyPower`（`:454-482`） | **32 B** | `2^p` | **18**（p=19） | 同一 `verifyPower` 的第二步，FFT 之后 |
+| **C `resLagrange`** | `verifyPower`（`:454-482`） | **32 B** | `2^p` | **18**（p=19） | 同一 `verifyPower` 的第三步，FFT 之后 |
+| **D batchconvert** | `engine_batchconvert.js:23-32`（`:470,474` 调用） | **32 B 进 / 32 B 出** | `2^p` | 无（不按位块切） | `resTau` 之后、FFT 前后各一次 |
 
-**A 稿的错误就是把 C 的参数用在了 A 和 B 上。** 三者不可合并：位块数差 6 倍，point-chunk 数与单任务载荷全部不同。
+**A 稿的错误就是把 C 的参数用在了 A 和 B 上。** A/B/C 三者不可合并：位块数差 6 倍，point-chunk 数与单任务载荷全部不同。
+**D 不是 MSM**，它按 `concurrency` 等分、每块**两次分配**，作用是解释 §5.4 的 28 页事件与 JS 侧 48 MiB 瞬时副本。
 
 ### 3.1 MSM 路径（按账目分支）
 
 ```mermaid
 flowchart TD
     A["snarkjs powersoftau verify"] --> A1["Phase 1: processSection x4<br/>4 B 标量, 64 Ki 点分片"]
-    A --> B1["Phase 2: verifyLagrangeEvaluations<br/>verifyPower(p), p=0..18, 再 p=19"]
+    A --> B1["Phase 2: verifyLagrangeEvaluations x4<br/>tauG1 only: verifyPower(0..18) + (19)"]
     A1 --> A2["每分片 2 次 multiExpAffine(n-1 点)<br/>bit-chunk=3, point-chunk=10, 任务 30"]
     B1 --> B2["① resTau: Uint32Array<br/>4 B, bit-chunk=3, point-chunk=10"]
-    B1 --> B3["② BigBuffer(nPoints*32) → fft<br/>32 B, bit-chunk=18, point-chunk=2"]
+    B1 --> B3["② BigBuffer(nPoints*32) → batchTo<br/>→ fft → batchFrom (账目 D)"]
+    B1 --> B4["③ resLagrange: 32 B<br/>bit-chunk=18, point-chunk=2"]
     A2 --> C["_multiExpChunk → queueAction<br/>结构化克隆, 无 transfer"]
     B2 --> C
-    B3 --> C
-    C --> D["worker ALLOCSET → u8.set 进 WASM<br/>memory.grow 后永不缩容"]
-    D --> E["GET 144 B → Promise.all → 主线程累加"]
+    B4 --> C
+    C --> W["worker ALLOCSET → u8.set 进 WASM<br/>memory.grow 后永不缩容"]
+    W --> R["GET 144 B → Promise.all → 主线程累加"]
 ```
 
 ### 3.2 FFT 路径（`resLagrange` 前置；`prepare_phase2` 的主路径）
@@ -154,12 +178,15 @@ node scripts/m5_budget.cjs --power 18 --operation phase1
 node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 ```
 
-**两个必须在读数字前接受的假设**：
+**两个边界假设：只定义区间端点，不是预测值**（下表给出方向与推翻方式，二者都必须在 M5-B 里被实测替换）：
 
-- **HYP-1**：Worker 初始化后 `u32[0]` 基址取 **0**（F20 未实测）。真实基址只会把容量再抬整页，方向已知。
-- **HYP-2**：Worker 容量总和按"大分片优先分配到不同 Worker"计算，是**上界**。实际分配取决于调度顺序
-  （36 个任务 / 28 个 Worker 时，18 个大任务必然落在 18 个不同 Worker，其余 10 个任务可能复用已扩容的 Worker）。
-  因此真实值落在"只有 18 个大分片 Worker 被扩容"与"28 个全部扩容"之间。
+| 假设 | 内容 | 方向 | 如何被替换 |
+| --- | --- | --- | --- |
+| **HYP-1** | Worker 初始化后 `u32[0]` 基址取 **0**（F20 未实测） | **下界**：真实基址 `b > 0` 只会把 `requiredPages` 抬高 `ceil` 量级的整页，绝不会降低 | `worker_task.alloc_base`：每个 Worker 在 `INIT` 后只读一次 |
+| **HYP-2** | 容量总和按"n 个大分片各落在一个不同 Worker"计 | **上界**：这是最坏归属，**不代表实际调度顺序**（28 个 Worker / 36 个任务时，10 个小任务可能复用已扩容的 Worker） | `worker_task.worker`：逐任务记录真实 Worker 号，按实际归属重算 |
+
+> 因此 §5 所有"Worker 容量合计"只有一个身份：**落在 [下界, 上界] 区间内的静态端点**。
+> 它既不是测量值，也不是点预测。任何"模型吻合 X%"的说法都必须先通过 §7.6 的 L2 精确回放。
 
 ### 5.1 账目 A：Phase 1（4 B 标量）
 
@@ -169,6 +196,12 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 | **tauG2** | **G2** | 262144 | 4 | 65535 | 12 | 3 | 10 | 30 | 1.3 | 35.9 | **42** |
 | alphatauG1 | G1 | 262144 | 4 | 65535 | 12 | 3 | 10 | 30 | 0.7 | 18.3 | 25 |
 | betatauG1 | G1 | 262144 | 4 | 65535 | 12 | 3 | 10 | 30 | 0.7 | 18.3 | 25 |
+| betaG2 | G2 | 1 | 1 | — | — | — | — | 0 | 0 | 0 | 25 |
+
+- `betaG2` 走的是另一条函数（`processSectionBetaG2`，`:316-338`）：**只读 192 B**，`fromRprLEM` +
+  `toRprUncompressed` 全在主线程完成，**没有 MSM、没有 Worker 任务、没有 WASM 分配**。
+  它的内存上界是一个 `Uint8Array(192)` 加一个 Jacobian 点（< 1 KiB），**不是"约 1 MiB"的待估项，可判为 0**。
+  这也是 A.1 稿唯一没有闭合的零散路径，现予闭合。
 
 - G1 分片 `7021×96×2 = 1,348,032 B < 25 页` → **不扩容**，Worker 停在 25 页。
 - G2 分片 `7021×192×2 = 2,696,064 B > 25 页` → 扩到 `floor(2,696,064/65536)+1 = 42` 页 = 2.625 MiB。
@@ -199,46 +232,116 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 - 单任务 `337,042 × 128 B = 41.1 MiB`；克隆总量 `18 × 524,288 × 128 B = 1152 MiB`，**与并发度无关**。
 - 988 页 = `floor(2·32,356,032 / 65536)+1`，即 61.75 MiB/Worker 的容量；容量 ≠ 驻留。
 
-### 5.4 其他项（p18）
+### 5.4 账目 D：`Fr.batchTo/FromMontgomery`（32 B 进出）
+
+`verifyPower` 在 `resTau` 之后、`resLagrange` 之前，对**整个 `2^p` 标量缓冲**做两次 batchconvert
+（`:470` 与 `:474`）。两者都是 `buildBatchConvert(tm, "frm_batch*", 32, 32)`（`wasm_field1.js:71`），
+每个 chunk 的任务是 `ALLOCSET var0 (n×32)` + `ALLOC var1 (n×32)` —— **两次分配**，合计 `2·n·32` 字节。
+
+| p | 点数 | chunk 数 | 每 chunk 点（末块） | ALLOCSET / ALLOC (B) | 回放后页数 | 扩容 Worker | Worker 容量合计 |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 19 | 524,288 | 28 | 18,724（18,740） | 599,168 / 599,168 | **28** | **28 / 28** | **49.0 MiB** |
+| 18 | 262,144 | 28 | 9,362（9,370） | 299,584 / 299,584 | 25 | 0 | 43.75 MiB |
+| 17（p16 的最大档） | 131,072 | 28 | 4,681（4,685） | 149,792 / 149,792 | 25 | 0 | 43.75 MiB |
+
+回放口径（`threadman_thread.js:44-56`，基址 0、初始 25 页 = 1,638,400 B）：
+
+1. `ALLOCSET` 后 `top = 599,168`，判据 `top + 599,168 = 1,198,336 < 1,638,400` → **不扩容**；
+2. `ALLOC` 后 `top = 1,198,336`，判据 `top + 599,168 = 1,797,504 > 1,638,400` →
+   `requiredPages = floor(1,797,504 / 65,536) + 1 = **28**`。
+
+**28 页完全由 F4 的双计造成**：若不双计，只需 `floor(1,198,336 / 65,536) + 1 = 19` 页。
+
+**但它在 `prepared_verify` 里不抬高高水位** —— 因为同一次 `verifyPower` 中 `resTau` 先跑完：
+
+| power | 同迭代 `resTau` 留下的页数 | batchconvert 需要 | 抬高容量 |
+| ---: | ---: | ---: | --- |
+| 18 | 165 | 28 | 否（增量 0） |
+| 16 | 42 | 25 | 否（增量 0） |
+
+所以账目 D 的正确记法是：**容量历史上的一个实测点（28 页/Worker、绝对水平 49 MiB），不是峰值贡献项**。
+它只有在两种条件下才变成约束：① `alloc_base` 远大于 0（HYP-1 被推翻，见 §8 步骤 3）；
+② `resTau` 路径被改造或去除（M6 的候选场景，本轮明令不碰）。
+
+主线程侧（`engine_batchconvert.js:22,28,35,40-46`）：`BigBuffer.slice` 跨页 → **必然复制**。
+调用期间共存 `输入 16 + 分片副本 16 + GET 结果 16 + 输出 16 = 64 MiB`，相对调用前**新增 48 MiB**；
+`verifyPower` 里连续两次（to / from），故 JS 侧瞬时增量 ≈ 48 MiB（输入 16 MiB 本已存在，不重复计）。
+
+### 5.5 其他项（p18）
 
 | 项 | 值 | 依据 |
 | --- | ---: | --- |
 | Fr FFT @`2^19`（`resLagrange` 前置） | 32×16384，在途 16 / Worker 43.8 / 输入副本 16 / 输出 16 MiB | F17, F18 |
-| Fr batchTo/FromMontgomery @`2^19` | 28 分片，在途 16 MiB | `engine_batchconvert.js:12,28` |
+| Fr batchTo/FromMontgomery @`2^19` | 见 **§5.4 账目 D**（28 页、49 MiB、不抬高水位） | `engine_batchconvert.js:23-32` |
 | FastFile 页池 | 52.8 MiB（`2^19×192 B` 的 G2 读，M4.1 已测） | — |
 
 `prepare_phase2`（对照，不同操作，由 `--operation prepare_phase2` 输出）：p18 最大 ifft 为 32×16384 点，
 在途 72 / Worker 容量 190.8 / 装配（输入副本 48 + `chunks[]` 72 + 输出 48 = 168）MiB，模型合计 **≈ 431 MiB**；
 M3 实测峰值 1610 MiB，**差额约 1180 MiB 目前无法归属**（见 §10.6）。这个差额不用于支撑任何机制断言。
 
-### 5.5 增量对账（同一窗口，只用增量）
+### 5.6 增量对账（只用增量；不跨量纲相加去"预测 WS"）
 
-M4.1 的 `+2160 MiB` 是"phase-2 起始标记 → tauG2 标记"之间 `current WS` 的变化，**它本身就是一个增量**，
-所以可以与模型增量直接比较；绝不能用它去和模型的"共存绝对值"比。
+M4.1 的记录里"`+2160 MiB`"是"phase-2 起始标记 → tauG2 标记"之间 `current WS` 的变化，**它本身是一个增量**，
+所以只能与**同性质的增量**对话，不能用它去比模型的"共存绝对值"，更不能把模型的几个量相加后宣称
+"这就是 WS 预测值"。
+
+**先把单次引用换掉**：三个 run 的同一段增量（`results/raw/m4_1_prepared_verify_p1x_r{1,2,3}.json` 的阶段标记）如下。
 
 | 量 | p16 | p18 |
 | --- | ---: | ---: |
-| 实测 tauG1 段增量（M4.1 时间线） | +194 MiB | **+2160 MiB** |
-| 模型：`resLagrange` 在途 | 265.1 | 969.1 |
-| 模型：`resLagrange` Worker 容量 | 398.8 | 1454.6 |
+| 实测段增量 r1 / r2 / r3 | +194 / +207 / +238 | +2160 / +2487 / +2636 |
+| 实测均值（极差） | **213**（44） | **2428**（476，±10%） |
+| 模型：`resLagrange` 在途（JS 字节） | 265.1 | 969.1 |
+| 模型：`resLagrange` Worker 容量（WASM 地址空间） | 398.8 | 1454.6 |
 | 模型：减去 Phase 1 基线（72.4） | −72.4 | −72.4 |
-| **模型段增量** | **591.5** | **2351.3** |
-| 模型 / 实测 | 3.0× | **1.09×** |
-| 同窗绝对量：起始 current WS + 模型增量 | 1035 + 592 = 1627 MiB | 776 + 2351 = **3127 MiB** |
-| 同窗实测：tauG2 标记处 current WS | 1229 MiB | **2936 MiB** |
-| 差值 | +398 MiB（+32%） | **+191 MiB（+6.5%）** |
+| **模型段增量（两者之和）** | **591.5** | **2351.3** |
+| 模型 / 实测均值 | **2.8×** | **0.97×** |
+| 模型落在实测区间内？ | 否 | **是**（2160–2636） |
 
-三条读法：
+**三条必须写死的读法**：
 
-- **p18 仍有 8.9% 的正偏差**，方向上模型是上界，但**不再是 A 稿声称的 2% 吻合**，也不能说"机制已被证明"。
-- **p16 差 3.0×**，且同窗绝对量 1627 MiB 与全程峰值 1657 MiB 接近纯属巧合——p16 的全程峰值出现在 tauG1
-  窗口**之外**，这正是"不能拿全程峰值比同窗模型"的实例。
-- **p16 / p18 偏差量级不同**说明还有未建模项，或"容量已扩但未写满"。这两者只能由探针区分。
-  **这不是结论，是 M5-B/C/D 要收敛的对象。**
+1. **"模型是上界"这个身份不成立**：p18 的模型 **低于**均值（0.97×），p16 的模型 **高于**均值（2.8×）。
+   方向相反，说明这两档的主导项不同（p16 由固定开销与未写满的容量主导，p18 由在途与真实扩容主导），
+   而不是"模型统一保守"。
+2. **这个比较的噪声已经大于信号**：p18 三次的极差 476 MiB（±10%）**大于**模型与均值的差（−77 MiB）。
+   换句话说，**用这组数不能判定模型对错**，只能判定"同量级"。任何"吻合 91% / 偏高 8.9%"的表述都撤回。
+3. **分子是两种不同东西的和**：在途字节是 JS 堆/`arrayBuffers` 的真实副本；容量增量是 WASM 线性内存的
+   **地址空间**，扩了不等于写过、更不等于驻留。相加隐含"两者同时驻留且全部计入 WS"的假设。
+   分母 `current WS` 又是操作系统在某一采样点的驻留页集合，既不含未触碰的 WASM 页，也可能滞后于
+   V8 尚未回收的 ArrayBuffer。**三者只能并列，不能相加。**
 
-### 5.6 外推
+因此：**不在本文件里做任何"模型吻合 WS"的断言**。§5.4 的账目与 §5.3 的在途量只在 §7.6 的 L3
+（同刻并列四个量 + 残差区间）里才有意义。A.1 稿的 `776 + 2351 = 3127` 对 2936 的 6.5% 比较**已删除**。
 
-A 稿的 p19–p21 外推表**删除**。理由：模型在 p16 上差 3 倍，用它外推两档之外没有意义，
+仍成立的一条读法：**p16 的 1627 MiB 与全程峰值 1657 MiB 接近纯属巧合**——p16 的全程峰值出现在 tauG1
+窗口**之外**。这正是"不能拿全程峰值比同窗模型"的实例。
+
+### 5.6.1 phase 2 的四个 section **共用容量**，不是四次独立增长
+
+`verifyLagrangeEvaluations` 在一次 phase 2 里被调用 **4 次**（`:271-282`）：`tauG1`(G1, section 2)、
+`tauG2`(G2, 3)、`alphaTauG1`(G1, 4)、`betaTauG1`(G1, 5)。只有 `tauSection == 2` 会多跑一次
+`verifyPower(power+1)`（`:406-409`），所以**只有 tauG1 的最大迭代到 `2^19`，其余三个到 `2^18`**。
+
+如果按"四个 section 各涨 2351 MiB"推，p18 会到约 10 GiB —— 实测不是这样：
+
+| section 起点标记（r1） | current WS | 相对上一段 |
+| --- | ---: | ---: |
+| phase-2 tauG1 开始 | 776 MiB | — |
+| phase-2 tauG2 开始 | 2936 MiB | **+2160** |
+| phase-2 alphaTauG1 开始 | 3202 MiB | +266 |
+| phase-2 betaTauG1 开始 | 3432 MiB | +230 |
+| 全程峰值（r1 / r2 / r3） | 3738 / 3894 / 3721 MiB | — |
+
+原因是 **WASM 容量单调且不缩容**（F7）：tauG1 已经把 28 个 Worker 推到 988 页（61.75 MiB/Worker），
+后面三段的需求是 1043 页（tauG2，G2 的 192 B/点）与 522 页（G1 @`2^18`），**只补增量、不重新分配**。
+这解释了为什么后三段各只有 +230~+270 MiB：那是**新触碰的页**，不是新容量。
+
+> 对 M5 的直接含义：`resLagrange` 的容量账目**只需算 tauG1 的最大档**（988 页）；tauG2 的 1043 页是
+> 比它更高的一个点（+55 页/Worker ≈ +96 MiB），必须在 L2 里逐 Worker 核对，但**不是第二份 2351 MiB**。
+
+### 5.7 外推
+
+A 稿的 p19–p21 外推表**删除**。理由：模型在 p16 上差 2.8×，用它外推两档之外没有意义，
 且 M3 已撤回同类估算。只保留定性陈述：`prepared_verify` 的单次分配量随 `N` 线性增长，
 Worker 容量由"最大 point-chunk"决定、在并发度固定时同样随 `N` 增长，因此 p20 以上在本机（31.7 GiB）
 存在风险；**要报 p19+ 的数必须实测**。
@@ -252,7 +355,7 @@ Worker 容量由"最大 point-chunk"决定、在并发度固定时同样随 `N` 
 | 假设 | 内容 | 证实证据 | 推翻条件 |
 | --- | --- | --- | --- |
 | **H-A** | p18 tauG1 段的增长主要来自 `resLagrange` 的克隆在途 | `task_send` 在途时间序列的峰 ≥ 800 MiB，且与 WS 上升同相位 | 在途峰 < 500 MiB |
-| **H-B** | Worker 容量 ≈ 2× 首个大分片，任务结束后不回落 | 18 个跑大分片的 Worker 容量 ≈ 988 页（±2 页）；`grows ≥ 1`；结束后采样不下降 | 实测 ≈ 494 页（说明 F4 读错）或扩容后回落 |
+| **H-B** | Worker 容量 ≈ 2× 首个大分片（`alloc()` 双计），任务结束后不回落 | 逐 Worker 回放得 988 页（`alloc_base` 用实测值代入后**精确相等，无容差**）；`grows ≥ 1`；结束后采样不下降 | 回放页数与实测不符（F4 读错或命令流漏记）或扩容后回落 |
 | **H-C** | p18 `prepared_verify` 中 FFT + FastFile 合计 < 160 MiB | C9–C11 记账 + 页池快照 | 合计 > 300 MiB |
 | **H-D** | `prepare_phase2` 的峰值主体**无法**由任何单次分配解释 | `arrayBuffers` 高水位 ≫ 探针在途量，且差额随时间累积 | 探针能逐项对上 ≥ 80% 的高水位 |
 
@@ -318,9 +421,16 @@ return M5_ON ? { __m5: snapshot, out: ctx.out } : ctx.out;   // 关闭时零差�
 | `fft_plan` | `_fft` 入口 | `op, p, n_points, bits, points_in_chunk, n_chunks, copy_bytes` |
 | `task_send` | `postAction` | `task_id, call_id, worker, site, send_bytes, inflight, queue_depth, ts` |
 | `task_done` | `getOnMsg` | `task_id, worker, svc_ms, inflight_after` |
-| `worker_task` | worker `runTask` 末尾 | `worker, task_id, call_id, wasm_before, wasm_after, grow_pages, grows, alloc_base, alloc_top, allocset_bytes, get_bytes, w_heap_used, w_external, w_array_buffers` |
+| `worker_task` | worker `runTask` 末尾 | `worker, task_id, call_id, alloc_base, wasm_before, wasm_after, alloc_top, grows, allocs[], grow_events[], allocset_bytes, get_bytes, w_heap_used, w_external, w_array_buffers` |
 | `heap_sample` | 主线程 200 ms | `rss, heap_used, external, array_buffers` |
 | `fft_assembly` | `_fft` 末尾 | `copy_bytes, chunks_bytes, out_bytes` |
+
+`allocs[]` / `grow_events[]` 是 A.2 新增的两个字段，作用是让 L2 能**精确回放**而不需要任何容差：
+
+- `allocs[]`：按命令顺序列出本任务每个 `ALLOC` / `ALLOCSET` 的字节数（`len` 或 `buff.byteLength`）。
+  MSM 任务是 `[bases, scalars, jac]`，batchconvert 是 `[n·sIn, n·sOut]`，FFT mix 是 `[sMid·pts]`。长度 ≤ 6，追加成本可忽略。
+- `grow_events[]`：`[{at_alloc: i, from_pages, to_pages}]`，在 `alloc()` 内部记录 `memory.grow` 的实际前后页数。
+- 二者加 `alloc_base` 与 `wasm_before`，即可从 `alloc_base` 起逐条重放，**页数必须逐一相等**（§7.6 L2）。
 
 字段口径（四条，容易搞错）：
 
@@ -341,8 +451,17 @@ return M5_ON ? { __m5: snapshot, out: ctx.out } : ctx.out;   // 关闭时零差�
 | 层 | 门槛 | 判定方式 |
 | --- | --- | --- |
 | **L1 算法切分** | `n_points / s_scalar / bit_chunk / n_bit / n_point_chunk / chunk_pts / 任务数` **逐字段与源码复算相等** | `msm_plan` 与 `m5_budget.cjs --json` 无条件 diff；任一不等即失败 |
-| **L2 逐 Worker 内存** | 每个 Worker 的 `alloc_base`、`grows`、`wasm_after` 与"`2·首块` + 64 KiB 页粒度"的复算**逐 Worker 相等**（允许基址偏移的整页差） | 逐 Worker 表；不接受"总量接近" |
-| **L3 阶段总量** | 在同一采样时刻比较四量：在途任务字节、WASM 容量、current WS、`arrayBuffers`；**未解释残差必须显式列出**（残差 = WS − 已知项），**不设百分比门槛** | 时间对齐表 + 残差列 |
+| **L2 逐 Worker 内存** | 从 `alloc_base` 起按 `allocs[]` **逐条回放**：每条 `ALLOC`/`ALLOCSET` 后的 `top`、每次 `grow_events` 的 `from_pages → to_pages`、任务收尾的 `wasm_after`，均与 `memory.buffer.byteLength` **逐 Worker、逐事件精确相等**。**不设任何容差** | 逐 Worker 回放表；首个不符的 `(worker, task_id, alloc_index)` 即判失败 |
+| **L3 阶段总量** | 同一采样时刻**并列**四量（在途任务字节、WASM 容量、current WS、`arrayBuffers`），并给出 WS 的可核对分解与**残差区间**；**不设百分比门槛** | 时间对齐表 + 残差区间列 |
+
+**L2 为什么可以要求精确相等**：`alloc_base`、每个 `ALLOC`/`ALLOCSET` 的字节数、每次 `grow` 的前后页数、
+以及 `wasm_after` 都是探针能直接观测的事件，没有任何一项需要猜测。页粒度固定 64 KiB，
+`requiredPages = floor((top + len)/65536)+1` 是确定性算术，因此"差一页"就意味着**探针漏了一个事件**
+或 **`allocs[]` 与真实命令流不符**——这正是必须失败而不是容忍的情形。
+
+**L3 的残差是区间，不是一个数**：`arrayBuffers` 可直接算作驻留候选；WASM 容量**不能**直接计入 WS
+（扩了不等于写过），只能用 `[0, capacity]` 作为上下界。所以残差报为
+`WS − arrayBuffers − Σ_known` 的区间，并注明端点假设。**绝不再把在途字节与容量相加后与 WS 比大小。**
 
 L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模型缺什么。
 
@@ -360,7 +479,9 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 1. `M5_TRACE=1` 跑 `prepared_verify @ p10`：`provenance.resolved` 指向 vendor 副本；JSONL 可解析；
    `concurrency=28`；`task_send` 数 == `worker_task` 数；L1 全字段相等。
 2. 关闭探针再跑一次，比较 peak WS 与耗时（墙钟 ≤ +10%；peak WS 落在 M4.1 同 power 的会话内 CV 内）。
-3. 读 `worker_task.alloc_base` 真值；若 ≠ 0，把 §5 全部容量按整页上修并复述。
+3. 用实测 `alloc_base` + `allocs[]` 逐 Worker 精确回放（L2），把 §5 的容量列由「HYP-1 下界」替换为
+   **实测值**；若实测页数 > 静态页数，必须定位到具体 `(worker, task_id, alloc_index)`，
+   不接受"按整页上修若干页"这种笼统修正。
 
 **M5-D（p16 / p18 正式归因）**
 
@@ -377,29 +498,62 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 | RQ1 FFT 输入副本与分片是否峰值主要贡献者 | `fft_plan.copy_bytes`、`fft_assembly.*` | 与 MSM 在途同图；H-C |
 | RQ2 MSM 分片与 Worker 克隆同时存活多少 | `task_send.send_bytes` + `inflight` 时间序列 | 在途峰对 969 MiB；H-A |
 | RQ3 各 Worker WASM 是否持续增长并保留 | `worker_task.wasm_before/after/grow_pages/alloc_base` | L2 逐 Worker 对账；H-B |
-| RQ4 p18 tauG1 的 +2.2 GiB 由什么解释 | 上述三者同刻叠加 + `heap_sample.array_buffers` 残差 | L3 残差列，不设百分比门 |
+| RQ4 p18 tauG1 的 +2.2 GiB 由什么解释 | 上述三者**同刻并列** + `heap_sample.array_buffers` + 残差区间 | L3 残差区间，不设百分比门、不相加 |
 
 ---
 
 ## 10. 风险与未解释项
 
-1. **模型不是测量**。§5 所有数字是"源码算术 + HYP-1/HYP-2"，只有 §8 跑完才有结论权。
-2. **初始 allocator 基址未知**（F20）。它只影响容量（整页级别），不影响切分与在途量；M5-B 读真值。
-3. **Worker 容量分配依赖调度顺序**（HYP-2）。1455 MiB 是上界；下界是"只有 18 个大分片 Worker 被扩容"。
+1. **模型不是测量**。§5 所有数字是"源码算术 + HYP-1（下界）/ HYP-2（上界）"，只有 §8 跑完才有结论权。
+2. **初始 allocator 基址未知**（F20）。它是 **HYP-1 下界**的来源：真实基址只会抬高 `requiredPages`，
+   不会降低；M5-B 用 `alloc_base` + 逐条回放替换它。
+3. **Worker 容量归属依赖调度顺序**（HYP-2）。1455 MiB 是**上界**（n 个大分片各占一个 Worker），
+   下界是"只有被大分片命中的 Worker 扩容"。**两者都不是实际情况**，实际值只能由 `worker_task.worker` 统计。
 4. **V8 的 ArrayBuffer 回收不可观测**：`arrayBuffers` 只给当前持有量，给不出释放时刻。
 5. **WASM 容量 ≠ 驻留**：扩容但未写满的页可能不在 WS 里，H-B 只能证明"容量增长"。
 6. **`prepare_phase2` 的 920–1180 MiB 差额目前无法归属**，可能是未统计的缓冲、Worker 内存或外部内存；
    在 M5-D 之前不得称其为"碎片"。
 7. **Windows 口径**：继续用 `PeakWorkingSet64` / `PeakPagedMemorySize64`，不引入新口径。
 8. **单位纪律**：全文 MiB；源码里的字节数保留精确值，禁止用十进制 MB 近似替代。
+9. **三个量纲不可互加**：在途字节（JS 副本）、WASM 容量（线性内存地址空间）、Working Set（驻留页集合）
+   是三种不同的内存口径。可以**同刻并列**，可以各自单独与实测比，但**任何相加后宣称"预测 WS"的做法都禁止**
+   （A.1 稿的 `776 + 2351 = 3127` 已删除，原因即此）。
+10. **账目 D 不抬高高水位但必须记录**：`batchTo/FromMontgomery` 在 p18 把每个干净 Worker 推到 28 页
+    （28 个 Worker 合计 49 MiB），但它在同一次 `verifyPower` 中晚于 `resTau`（165 页 / p16 42 页），
+    因此对峰值贡献为 0。写报告时必须同时给出这两个事实，不能只写"49 MiB"让人误读为增量。
+11. **阶段增量是单采样点，噪声不可忽略**：p18 同一段（phase-2 起始 → tauG2 标记）三次为
+    +2160 / +2487 / +2636（极差 476 MiB，±10%），p16 为 +194 / +207 / +238。
+    任何引用段增量的地方必须给出三次读数与均值；**M4.1 文档里的 `+2160` 是 r1 的读数**，不得当作"该段的实测值"。
 
 ---
 
 ## 11. 评审门与后续
 
-- **M5-A.1（本文件）**：需确认 ① 三条账目的划分是否完整（是否还有零散 MSM 未覆盖，例如 `betaG2`）；
-  ② HYP-1 / HYP-2 的表述是否可接受（模型只作上界，不作预测）；③ §7.6 三层门槛是否覆盖你关心的失败模式。
-- **M5-B**：patch + resolve hook + provenance 自证 + 入队绑定，交付 `patches/m5-instrumentation.patch`。
-- **M5-C**：p10 smoke 过 L1 / L2 + 扰动预算。
-- **M5-D**：p16/p18 交错对照，产出归因表与残差。
+**A.2 对三条评审意见的落实**（对应你上一轮的判断）：
+
+| 你的意见 | 落实情况 | 位置 |
+| --- | --- | --- |
+| ① 三条账目还不完整，必须补 `batchTo/FromMontgomery`；28 页 / 49 MiB 不能漏 | **已补为账目 D**：两次分配 599,168 B、25→28 页、28 个 Worker 合计 49 MiB；并给出"晚于 `resTau`，故不抬高高水位"的绑定判断（p18 165 页 / p16 42 页） | §5.4 |
+| ② HYP-1/HYP-2 只能作边界假设 | 改为**下界 / 上界**两张边界表，明确"HYP-2 不代表实际调度顺序"与"两者都不是实际情况" | §5.0、§10.2-3 |
+| ③ 不接受 L2 的"基址偏移整页差"容差 | **删除容差**，改为从 `alloc_base` 起按 `allocs[]` 逐条回放、页数逐一精确相等；并说明为何可以要求精确相等 | §7.6、§7.4 |
+| ④ 3127 对 2936 的 6.5% 不能当吻合证据 | **删除该比较**；新增"三个量纲不可互加"的硬约束，L3 残差改为区间 | §5.6、§10.9 |
+
+**A.2 自行发现的两处问题**（你未提，但同样影响结论）：
+
+- **单次 `+2160 MiB` 不可代表段增量**：三次为 2160 / 2487 / 2636（±10%），模型 2351 落在区间内（0.97×），
+  而 p16 为 2.8× —— **"模型是上界"不成立**，且该比较的噪声大于信号，不能用来判定模型对错。§5.6、§10.11
+- **`betaG2` 已闭合**（读 192 B、无 Worker、无 WASM）→ 上界 < 1 KiB，判为 0。§5.1
+
+**待你确认的三点**：
+
+1. 账目 D 的记法（"记录、但不计入峰值"）是否接受——我按"容量历史点 + 增量 0"处理，并在 §10.10 写了误读防护。
+2. "上界"身份撤回、改为"同量级且噪声大于信号"，是否作为 M5 结论的最终措辞。
+3. L2 的**无容差精确回放**是否作为 M5-B 的硬门（不通过则整次运行作废）。
+
+- **M5-B**：patch + resolve hook + provenance 自证 + 入队绑定 + `allocs[]`/`grow_events[]`，交付 `patches/m5-instrumentation.patch`。
+- **M5-C**：p10 smoke 过 L1 / L2（精确回放）+ 扰动预算。
+- **M5-D**：p16/p18 交错对照，产出归因表与残差区间。
 - **M5-E**：写 `docs/M5_ATTRIBUTION.md`，届时**才**讨论 H1 / 并发 / 缓冲寿命的优先级；在此之前不写优化代码。
+
+> **边界声明**：A.2 是本项目**最后一次静态设计校准**。此后不再靠纸面预算推导内存峰值——所有数字要么来自
+> 探针，要么明确标注为"边界假设"。

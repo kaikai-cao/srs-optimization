@@ -317,12 +317,72 @@ function fftLedger(nPoints, concurrency, sIn, sMid, sOut) {
   };
 }
 
+/**
+ * engine_batchconvert.js:23-32 -- one task per chunk, and EVERY task does
+ * TWO allocations: ALLOCSET var0 (buffChunk, n*sIn) then ALLOC var1 (n*sOut).
+ * Fr.batchToMontgomery / batchFromMontgomery are built with sIn = sOut = n8 (32).
+ * The two allocations are what pushes a clean 25-page worker to 28 pages at
+ * 2^19 points, purely because alloc() demands top + length (F4).
+ */
+function batchConvertLedger(nPoints, concurrency, sIn, sOut) {
+  const pointsPerChunk = Math.floor(nPoints / concurrency);
+  const chunks = [];
+  for (let i = 0; i < concurrency; i++) {
+    const n = i < concurrency - 1 ? pointsPerChunk : nPoints - i * pointsPerChunk;
+    if (n === 0) continue;
+    const allocs = [n * sIn, n * sOut];
+    const replay = replayWorkerMemory(allocs);
+    chunks.push({
+      points: n,
+      allocs,
+      top: replay.top,
+      pages: replay.bytes / PAGE_BYTES,
+      grows: replay.grows,
+      memBytes: replay.bytes,
+    });
+  }
+  const maxPages = Math.max(...chunks.map((c) => c.pages));
+  const grownWorkers = chunks.filter((c) => c.grows > 0).length;
+  const workerWasmBytes = chunks.reduce((a, c) => a + c.memBytes, 0);
+
+  return {
+    kind: 'batchConvert',
+    nPoints,
+    pointsPerChunk,
+    sIn,
+    sOut,
+    taskCount: chunks.length,
+    chunks,
+    maxPages,
+    grownWorkers,
+    perChunkBytes: chunks[0].allocs[0] + chunks[0].allocs[1],
+    workerWasmBytes,
+    workerCapacityMiB: MiB(workerWasmBytes),
+    // main-thread JS side: input BigBuffer survives the call; each chunk is copied
+    // by BigBuffer.slice (span > page), each GET is a second copy, and the
+    // assembled output is a third.
+    mainThread: {
+      inputBytes: nPoints * sIn,
+      sliceCopyBytes: nPoints * sIn,
+      recvBytes: nPoints * sOut,
+      outBytes: nPoints * sOut,
+      transientAddBytes: nPoints * sIn + 2 * nPoints * sOut,
+      peakBytes: 2 * nPoints * sIn + 2 * nPoints * sOut,
+    },
+    // binding is a per-iteration question: this op runs AFTER resTau in the same
+    // verifyPower iteration, so it only binds if it needs more pages than resTau left.
+    callsPerPower: 2,
+  };
+}
+
 // ---- reporting -------------------------------------------------------------
 function printPreparedVerify(power, concurrency) {
   const p1 = phase1Ledger(power, concurrency);
   const big = verifyPowerLedger(power + 1, concurrency);
   const mid = verifyPowerLedger(power, concurrency);
   const fft = fftLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr, S.Fr);
+  const bcBig = batchConvertLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr);
+  const bcMid = batchConvertLedger(2 ** power, concurrency, S.Fr, S.Fr);
 
   console.log(`### prepared_verify @ power ${power} (concurrency ${concurrency})\n`);
   console.log('#### A. phase 1 -- processSection, 4 B scalars (powersoftau_verify.js:361)\n');
@@ -357,8 +417,22 @@ function printPreparedVerify(power, concurrency) {
     `| ${mid.p} | ${mid.nPoints} | ${mid.resLagrange.bitChunkSize} | ${mid.resLagrange.nBitChunks} | ${mid.resLagrange.nPointChunks} | ${mid.resLagrange.taskCount} | ${f1(MiB(mid.resLagrange.perTaskSendMax))} | ${f1(MiB(mid.resLagrange.wave1SendBytes))} | ${mid.resLagrange.maxWorkerPages} | ${f1(MiB(mid.resLagrange.workerMemBytes))} |\n`
   );
 
+  console.log('#### D. Fr batchTo/FromMontgomery -- 32 B in/out, TWO allocations per chunk (engine_batchconvert.js:23-32)\n');
+  console.log('| p | points | chunks | pts/chunk (last) | bytes/chunk ALLOCSET+ALLOC | pages after | workers grown | worker WASM (MiB) | main-thread transient add (MiB) |');
+  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of [bcBig, bcMid]) {
+    console.log(
+      `| ${log2floor(r.nPoints)} | ${r.nPoints} | ${r.taskCount} | ${r.pointsPerChunk} (${r.chunks[r.chunks.length - 1].points}) | ${r.perChunkBytes} | ${r.maxPages} | ${r.grownWorkers} | ${f1(r.workerCapacityMiB)} | ${f1(MiB(r.mainThread.transientAddBytes))} |`
+    );
+  }
+  console.log(
+    `\nbinding check: resTau leaves ${big.resTau.maxWorkerPages} pages/worker, batchconvert needs ${bcBig.maxPages} -> ` +
+      `${bcBig.maxPages > big.resTau.maxWorkerPages ? 'BINDS (adds memory)' : 'non-binding at this iteration'}; ` +
+      `absolute level ${bcBig.maxPages} pages x ${concurrency} workers = ${f1(bcBig.workerCapacityMiB)} MiB.\n`
+  );
+
   const inc = big.resLagrange.wave1SendBytes + (big.resLagrange.workerMemBytes - p1.baselineBytes);
-  console.log(`#### D. tauG1 phase-2 segment increment (model, same window as M4.1)\n`);
+  console.log(`#### E. tauG1 phase-2 segment increment (model, same window as M4.1)\n`);
   console.log('| term | MiB |');
   console.log('| --- | ---: |');
   console.log(`| resLagrange in-flight | ${f1(MiB(big.resLagrange.wave1SendBytes))} |`);
@@ -368,7 +442,23 @@ function printPreparedVerify(power, concurrency) {
   console.log(`\nFr FFT @2^${big.p}: ${fft.nChunks} chunks x ${fft.pointsInChunk} pts, in-flight ${f1(MiB(fft.inflightPeakBytes))} MiB, worker WASM ${f1(MiB(fft.workerMemBytes))} MiB, input copy ${f1(MiB(fft.inputCopyBytes))} MiB`);
   console.log('\nAll worker-memory figures assume allocator base 0 and a descending\n(schedule-favourable) task-to-worker assignment: they are UPPER bounds.\n');
 
-  return { power, concurrency, phase1: p1, resTau: big.resTau, resLagrange: big.resLagrange, fft, inc };
+  return { power, concurrency, phase1: p1, resTau: big.resTau, resLagrange: big.resLagrange, fft, batchConvert: { big: bcBig, mid: bcMid }, inc };
+}
+
+function printBatchConvert(power, concurrency) {
+  const rows = [batchConvertLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr), batchConvertLedger(2 ** power, concurrency, S.Fr, S.Fr)];
+  console.log(`### Fr batchconvert @ power ${power} (concurrency ${concurrency})\n`);
+  console.log('| p | points | chunks | pts/chunk (last) | ALLOCSET (B) | ALLOC (B) | pages after | workers grown | worker WASM (MiB) |');
+  console.log('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const r of rows) {
+    const c = r.chunks[0];
+    console.log(
+      `| ${log2floor(r.nPoints)} | ${r.nPoints} | ${r.taskCount} | ${r.pointsPerChunk} (${r.chunks[r.chunks.length - 1].points}) | ${c.allocs[0]} | ${c.allocs[1]} | ${r.maxPages} | ${r.grownWorkers} | ${f1(r.workerCapacityMiB)} |`
+    );
+  }
+  console.log(`\nper-call main-thread bytes at 2^${power + 1}: input ${f1(MiB(rows[0].mainThread.inputBytes))} + slice copies ${f1(MiB(rows[0].mainThread.sliceCopyBytes))} + GET ${f1(MiB(rows[0].mainThread.recvBytes))} + out ${f1(MiB(rows[0].mainThread.outBytes))} MiB (transient add ${f1(MiB(rows[0].mainThread.transientAddBytes))} MiB)`);
+  console.log('Two calls per verifyPower iteration (toMontgomery, fromMontgomery), sequential.');
+  return rows;
 }
 
 function printPhase1(power, concurrency) {
@@ -417,8 +507,9 @@ function main(argv) {
   if (operation === 'prepared_verify') out = asJson ? null : printPreparedVerify(power, concurrency);
   else if (operation === 'phase1') out = printPhase1(power, concurrency);
   else if (operation === 'prepare_phase2') out = printPreparePhase2(power, concurrency);
+  else if (operation === 'batchconvert') out = printBatchConvert(power, concurrency);
   else {
-    console.error(`unknown --operation ${operation} (prepared_verify | phase1 | prepare_phase2)`);
+    console.error(`unknown --operation ${operation} (prepared_verify | phase1 | prepare_phase2 | batchconvert)`);
     process.exit(2);
   }
 
@@ -427,6 +518,7 @@ function main(argv) {
     const big = verifyPowerLedger(power + 1, concurrency);
     const mid = verifyPowerLedger(power, concurrency);
     const fft = fftLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr, S.Fr);
+    const bc = batchConvertLedger(2 ** (power + 1), concurrency, S.Fr, S.Fr);
     const inc = big.resLagrange.wave1SendBytes + (big.resLagrange.workerMemBytes - p1.baselineBytes);
     console.log(
       JSON.stringify(
@@ -439,8 +531,18 @@ function main(argv) {
           resTauMid: mid.resTau,
           resLagrangeMid: mid.resLagrange,
           fft,
+          batchConvert: {
+            p: log2floor(bc.nPoints),
+            points: bc.nPoints,
+            chunks: bc.taskCount,
+            maxPages: bc.maxPages,
+            grownWorkers: bc.grownWorkers,
+            workerCapacityMiB: f2(bc.workerCapacityMiB),
+            perChunkBytes: bc.perChunkBytes,
+            mainThread: bc.mainThread,
+          },
           modelIncrementMiB: f2(MiB(inc)),
-          assumptions: ['allocator base offset = 0', 'descending task-to-worker assignment (upper bound)'],
+          assumptions: ['allocator base offset = 0 (lower bound)', 'descending task-to-worker assignment (upper bound, not actual scheduling)'],
         },
         null,
         2
@@ -458,4 +560,5 @@ module.exports = {
   phase1Ledger,
   verifyPowerLedger,
   fftLedger,
+  batchConvertLedger,
 };
