@@ -39,15 +39,34 @@
 
 ---
 
-## 1. 结论摘要（给评审的 7 条）
+### 0.2 评审勘误（M5-B 实施期补正，**不构成新修订**）
+
+按评审裁定，A.2 直接通过，不再另开 A.3。下列五处属**文本与算术勘误**，在实施 M5-B 的同时就地改正：
+
+| # | A.2 的写法 | 勘误后 | 依据 |
+| --- | --- | --- | --- |
+| 1 | 账目 D 记为"容量历史点（28 页/Worker、49 MiB）" | **独立冷启动容量预算**：本次运行 `grow` 次数 = 0、容量增量 = 0；49 MiB 只在"从 25 页起跑"时成立 | §5.4、§10.10 |
+| 2 | §5.6.1 "tauG1 把 28 个 Worker 推到 988 页" | **18 个 @988 + 10 个 @549**（2 个 point-chunk：337,042 / 187,246 点） | §5.6.1 |
+| 3 | "tauG2 +55 页/Worker ≈ +96 MiB" | **`18×55 + 494 = 1,484` 页 = 92.75 MiB**（单 Worker 最大页数与池增量是两个量） | §5.6.1 |
+| 4 | HYP-2 = "最坏归属上界" | 首轮映射是 `processWorks()` 顺序扫描的**推论**（workers `0..C-1`），迟到任务已证明无增长 → 升级为**条件于点预测** | §5.0.1、§10.3 |
+| 5 | 主线程"64 MiB 同时存活" | 降级为**假设 P-1**：`slice()` 复制是必然（16 MiB/次），四者同时存活需探针判定 | §5.4、§10.12 |
+
+另：§5.6 结论措辞由"同量级且噪声大于信号"改为**"现有测量尚不能验证静态模型的准确性"**（三次样本不足以支持统计表述）。
+
+---
+
+## 1. 结论摘要（给评审的 8 条）
 
 1. **must-fix 已修**：`snarkjs` 在三个地方喂不同宽度的标量——`processSection` 4 B、`resTau` 4 B、`resLagrange` 32 B。
    A 稿把 32 B 的位块放大（18 个 bit-chunk）套到了全部 MSM 上，导致 Phase 1 基线与"2% 吻合"两个结论都不成立。
 2. **位块放大机制本身成立，但只对 32 B 路径成立**：p18 的 `resLagrange` 在 `2^19` 点上仍是 18 bit-chunk × 2 point-chunk
    = 36 任务、单任务 41.1 MiB、在途 969 MiB；而同一次 `verifyPower(19)` 里先跑的 `resTau`（4 B）只有 3 bit-chunk ×
    10 point-chunk = 30 任务、单任务 5.4 MiB、在途 146 MiB。
-3. **Worker WASM 的双倍余量机制成立**（`alloc()` 把 `length` 加了两次），但**每个 Worker 的容量取决于它接过哪个分片**，
-   所以"1455 MiB"是一个**上界**（按大分片优先分配），不是确定预测；真实值必须逐 Worker 读。
+3. **Worker WASM 的双倍余量机制成立**（`alloc()` 把 `length` 加了两次）。但"1455 MiB"这个数字 A.2 曾写成
+   "按大分片优先分配的上界"，其实**比那更强**：`processWorks()` 从 0 号 Worker 顺序取空闲
+   （`threadman.js:191-198`），`_multiExpChunk()` 在 `await` 前把整批位块任务同步入队，所以**首轮 28 个任务
+   就是 workers 0..27**，容量分布是确定的 `18×988 + 10×549`，不是排序取最坏。剩余任务（迟到任务）
+   在 §4 被证明"任何 Worker 都吃得下"，故**总和与调度顺序无关**。唯一未定的是 `alloc_base`（HYP-1）。
 4. **Phase 1 基线重算为 72.4 MiB**，驱动项不是 G1 而是 **G2 的 `tauG2` 段**（`65535×192×2 > 25 页` → 扩到 42 页）。
    扣除后的模型段增量 = 969.1 +（1454.6 − 72.4）= **2351 MiB**。
 5. **单次引用 +2160 MiB 不可靠，模型也不是统一上界**（A.2 新发现）：p18 三个 run 的 tauG1 段增量分别是
@@ -58,11 +77,15 @@
 6. **原 H1（FFT 输入副本）在 `prepared_verify @ p18` 上只有约 48 MiB**（16 输入副本 + 16 分片 + 16 输出），
    相对 MSM 的 969 + 1455 可忽略；`prepare_phase2` 相反，FFT 才是主路径，但它与实测的残差目前**无法解释**，
    只能说"模型漏了东西"，不能断言是碎片。
-7. **账目 D（`Fr.batchTo/FromMontgomery`）此前漏记，现已补上**：每个 chunk 做**两次**分配
-   （`ALLOCSET` 599,168 B + `ALLOC` 599,168 B），在 25 页的干净 Worker 上触发 `memory.grow` →
-   **28 页/Worker**，28 个 Worker 合计 **49 MiB**。但它在同一次 `verifyPower` 里**晚于** `resTau`：
-   p18 时 `resTau` 已把 Worker 推到 165 页、p16 时推到 42 页，所以这一步**不改变高水位**（增量 0），
-   只影响**容量历史**与主线程的 48 MiB 瞬时副本。**它必须被记录，但不能被当成峰值贡献项。**
+7. **账目 D（`Fr.batchTo/FromMontgomery`）此前漏记，现已补上，但它是"冷启动预算"而非本次扩容**：
+   每个 chunk 做**两次**分配（`ALLOCSET` 599,168 B + `ALLOC` 599,168 B），若从 25 页起跑会被
+   `alloc()` 的双计推到 **28 页/Worker**（28 个合计 **49.0 MiB**）；但它在同一次 `verifyPower` 里
+   **晚于** `resTau`，届时 Worker 已是 165 / 55 页（p18）或 42 / 25 页（p16），所以**本次 grow 次数 = 0、
+   容量增量 = 0**。它必须被记录，但不得写成"49 MiB 增量"。
+8. **容量池要按"单 Worker 最大页数"与"池增量"两个层次读**：tauG1 的 `resLagrange@2^19` 留下
+   `18×988 + 10×549 = 23,274` 页（1454.6 MiB）；tauG2 的 `resLagrange@2^18` 把 18 个 Worker 从 988
+   抬到 1043（各 +55）、把第 19 个从 549 抬到 1043（+494），**池增量 1,484 页 = 92.75 MiB**。
+   写成"28 个 Worker 各 +55 页 ≈ 96 MiB"会多算 3.5 MiB 且归属错误。
 
 ---
 
@@ -183,10 +206,23 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 | 假设 | 内容 | 方向 | 如何被替换 |
 | --- | --- | --- | --- |
 | **HYP-1** | Worker 初始化后 `u32[0]` 基址取 **0**（F20 未实测） | **下界**：真实基址 `b > 0` 只会把 `requiredPages` 抬高 `ceil` 量级的整页，绝不会降低 | `worker_task.alloc_base`：每个 Worker 在 `INIT` 后只读一次 |
-| **HYP-2** | 容量总和按"n 个大分片各落在一个不同 Worker"计 | **上界**：这是最坏归属，**不代表实际调度顺序**（28 个 Worker / 36 个任务时，10 个小任务可能复用已扩容的 Worker） | `worker_task.worker`：逐任务记录真实 Worker 号，按实际归属重算 |
+| **HYP-2** | 首轮任务按 `queueAction` 的入队顺序落到 workers `0..C-1` | **点预测（条件于 HYP-1）**：`processWorks()` 从 0 号扫起、`_multiExpChunk` 在 `await` 前同步入队，所以首个 `C` 个任务与 Worker 编号**一一对应**；迟到任务另证"任何 Worker 都吃得下"（见 §5.0.1），故总和与运行时顺序无关 | `worker_task.worker`：逐任务记录真实 Worker 号；若首轮出现非 `0..C-1` 的映射，F8 的读法错了 |
 
-> 因此 §5 所有"Worker 容量合计"只有一个身份：**落在 [下界, 上界] 区间内的静态端点**。
-> 它既不是测量值，也不是点预测。任何"模型吻合 X%"的说法都必须先通过 §7.6 的 L2 精确回放。
+#### 5.0.1 首轮映射为什么是确定的（A.2 之后补证）
+
+三个源码事实合起来把"调度顺序"从假设变成推论：
+
+1. `_multiExp` 外层按 **point-chunk** 递增（`engine_multiexp.js:128`），`_multiExpChunk` 内部对 **bit-chunk**
+   同步 `queueAction`（`:57-76`），且 `await Promise.all` 在其后（`:78`）。所以入队顺序是
+   `pc0·bc0 … pc0·bc17, pc1·bc0 …`。
+2. `queueAction` 立即 `processWorks()`（`threadman.js:212`），`processWorks` 从 `i=0` 找第一个空闲 Worker
+   （`:192-197`），`postAction` 标记 `working[i]=true`。所以前 `C` 个任务依次占满 `0..C-1`。
+3. 迟到任务（第 `C` 个之后）只在其需求 ≤ 当前**最小**容量时被证明无增长。计算器对 p16/p18 的全部
+   445 次调用逐一验证该条件成立（`late_provably_free = true`，0 例外），因此容量总和与"谁先空闲"无关。
+
+> 结论：除 `alloc_base` 外，§5 的容量表已经是**点预测**，可以直接作为 L2 的无容差判据；
+> 它是否成立由 `worker_task.wasm_after` 逐 Worker 判定，而不是靠"接近"。
+
 
 ### 5.1 账目 A：Phase 1（4 B 标量）
 
@@ -221,6 +257,8 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 
 `resTau@2^19` 的 165 页（10.3 MiB/Worker）**低于**同一次迭代 `resLagrange` 的 988 页，所以它不抬高最终高水位；
 但它在**时间上先发生**（`:452` 在 `:482` 之前），因此决定了 tauG1 窗口**前半段的** WS 形状。
+逐 Worker 看，首轮 28 个任务是 `27 × 165 页 + 1 × 55 页`（尾部 point-chunk 18,731 点），
+所以"每个 Worker 都留下 165 页"也不成立——这与 §5.4 的 `28 / 55` 是同一件事。
 
 ### 5.3 账目 C：`resLagrange`（32 B，FFT 之后）
 
@@ -238,11 +276,11 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 （`:470` 与 `:474`）。两者都是 `buildBatchConvert(tm, "frm_batch*", 32, 32)`（`wasm_field1.js:71`），
 每个 chunk 的任务是 `ALLOCSET var0 (n×32)` + `ALLOC var1 (n×32)` —— **两次分配**，合计 `2·n·32` 字节。
 
-| p | 点数 | chunk 数 | 每 chunk 点（末块） | ALLOCSET / ALLOC (B) | 回放后页数 | 扩容 Worker | Worker 容量合计 |
+| p | 点数 | chunk 数 | 每 chunk 点（末块） | ALLOCSET / ALLOC (B) | 冷启动回放后页数 | 本次实跑是否扩容 | 冷启动预算合计 |
 | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 19 | 524,288 | 28 | 18,724（18,740） | 599,168 / 599,168 | **28** | **28 / 28** | **49.0 MiB** |
-| 18 | 262,144 | 28 | 9,362（9,370） | 299,584 / 299,584 | 25 | 0 | 43.75 MiB |
-| 17（p16 的最大档） | 131,072 | 28 | 4,681（4,685） | 149,792 / 149,792 | 25 | 0 | 43.75 MiB |
+| 19 | 524,288 | 28 | 18,724（18,740） | 599,168 / 599,168 | **28** | **否（0 次 grow）** | **49.0 MiB**（28 × 28 页） |
+| 18 | 262,144 | 28 | 9,362（9,370） | 299,584 / 299,584 | 25 | 否 | 43.75 MiB（28 × 25 页） |
+| 17（p16 的最大档） | 131,072 | 28 | 4,681（4,685） | 149,792 / 149,792 | 25 | 否 | 43.75 MiB |
 
 回放口径（`threadman_thread.js:44-56`，基址 0、初始 25 页 = 1,638,400 B）：
 
@@ -252,20 +290,33 @@ node scripts/m5_budget.cjs --power 18 --operation prepare_phase2 --json
 
 **28 页完全由 F4 的双计造成**：若不双计，只需 `floor(1,198,336 / 65,536) + 1 = 19` 页。
 
-**但它在 `prepared_verify` 里不抬高高水位** —— 因为同一次 `verifyPower` 中 `resTau` 先跑完：
+**但它不是本次运行中真实发生过的一次扩容**——`batchToMontgomery` 在同一次 `verifyPower` 里晚于 `resTau`，
+那时 Worker 的容量早已远超 28 页：
 
-| power | 同迭代 `resTau` 留下的页数 | batchconvert 需要 | 抬高容量 |
-| ---: | ---: | ---: | --- |
-| 18 | 165 | 28 | 否（增量 0） |
-| 16 | 42 | 25 | 否（增量 0） |
+| power | 同迭代 `resTau` 之后的逐 Worker 页数 | batchconvert 需要 | 实际 grow 次数 |
+| ---: | --- | ---: | --- |
+| 18 | 27 个 @165 页、1 个 @55 页 | 28 | **0**（28 < 55） |
+| 16 | 27 个 @42 页、1 个 @25 页 | 25 | **0**（25 = 25，判据 `>` 不成立） |
 
-所以账目 D 的正确记法是：**容量历史上的一个实测点（28 页/Worker、绝对水平 49 MiB），不是峰值贡献项**。
+所以账目 D 的正确记法（按评审裁定改写）是：
+
+> **独立冷启动容量预算**：若 Worker 从初始 25 页执行 BatchConvert，p19 需要 28 页/Worker，合计 49.0 MiB。
+> 实际 `prepared_verify` 中该阶段发生在 `resTau` 之后，**不触发新的 WASM 扩容**，因此本阶段容量增量为 **0**。
+> M5-B 以逐 Worker 的 `wasm_before / wasm_after` 验证这一条（有 grow 事件即视为该判断被推翻）。
+
 它只有在两种条件下才变成约束：① `alloc_base` 远大于 0（HYP-1 被推翻，见 §8 步骤 3）；
 ② `resTau` 路径被改造或去除（M6 的候选场景，本轮明令不碰）。
 
-主线程侧（`engine_batchconvert.js:22,28,35,40-46`）：`BigBuffer.slice` 跨页 → **必然复制**。
-调用期间共存 `输入 16 + 分片副本 16 + GET 结果 16 + 输出 16 = 64 MiB`，相对调用前**新增 48 MiB**；
-`verifyPower` 里连续两次（to / from），故 JS 侧瞬时增量 ≈ 48 MiB（输入 16 MiB 本已存在，不重复计）。
+主线程侧（`engine_batchconvert.js:20,22-30,35,40-46`）：`BigBuffer.PAGE_SIZE = 1 GiB`（`bigbuffer.js:2`），
+16 MiB 的 `buff_r` **只占一个页**，`slice()` 走 `this.buffers[0].slice(...)`，即 `Uint8Array.prototype.slice`
+——**必然复制**，累计复制量 = 16 MiB。但"输入 16 + 分片 16 + GET 16 + 输出 16 = 64 MiB 同时存活"
+**不能只从源码推出**：`chunks` 是 28 个 `Promise.all` 同时挂着的，GET 结果与输出缓冲的存活窗口是否重叠
+取决于 V8 何时回收已被 `set()` 消费的分片。
+
+> 因此该 64 MiB 记为**峰值假设 P-1**，由 `fft_assembly` / `batchconvert_copy` 事件与 `heap_sample.array_buffers`
+> 在 M5-D 判定；**不作为既成事实引用**。可确定的只有两点：每次调用至少新增一份 16 MiB 分片副本（累计 16 MiB/次），
+> 输出缓冲 16 MiB 必然与输入共存。
+
 
 ### 5.5 其他项（p18）
 
@@ -303,8 +354,11 @@ M4.1 的记录里"`+2160 MiB`"是"phase-2 起始标记 → tauG2 标记"之间 `
 1. **"模型是上界"这个身份不成立**：p18 的模型 **低于**均值（0.97×），p16 的模型 **高于**均值（2.8×）。
    方向相反，说明这两档的主导项不同（p16 由固定开销与未写满的容量主导，p18 由在途与真实扩容主导），
    而不是"模型统一保守"。
-2. **这个比较的噪声已经大于信号**：p18 三次的极差 476 MiB（±10%）**大于**模型与均值的差（−77 MiB）。
-   换句话说，**用这组数不能判定模型对错**，只能判定"同量级"。任何"吻合 91% / 偏高 8.9%"的表述都撤回。
+2. **现有测量尚不能验证静态模型的准确性**：p18 的模型值落在三次观测范围内（2160–2636），p16 的模型值约为
+   实测均值的 **2.8 倍**。不同规模下的偏差方向与幅度不同，且 p18 三次的极差 476 MiB **大于**模型与均值的
+   差（−77 MiB）。因此现阶段**撤回模型上界判断与精度判断**，不写"吻合 x%"、不写"偏高 x%"，
+   后续以逐 Worker 遥测与同刻内存指标为准。
+   （三次样本不足以支持"噪声"这类统计表述，故本文件不再使用"噪声大于信号"的说法。）
 3. **分子是两种不同东西的和**：在途字节是 JS 堆/`arrayBuffers` 的真实副本；容量增量是 WASM 线性内存的
    **地址空间**，扩了不等于写过、更不等于驻留。相加隐含"两者同时驻留且全部计入 WS"的假设。
    分母 `current WS` 又是操作系统在某一采样点的驻留页集合，既不含未触碰的 WASM 页，也可能滞后于
@@ -332,12 +386,31 @@ M4.1 的记录里"`+2160 MiB`"是"phase-2 起始标记 → tauG2 标记"之间 `
 | phase-2 betaTauG1 开始 | 3432 MiB | +230 |
 | 全程峰值（r1 / r2 / r3） | 3738 / 3894 / 3721 MiB | — |
 
-原因是 **WASM 容量单调且不缩容**（F7）：tauG1 已经把 28 个 Worker 推到 988 页（61.75 MiB/Worker），
-后面三段的需求是 1043 页（tauG2，G2 的 192 B/点）与 522 页（G1 @`2^18`），**只补增量、不重新分配**。
-这解释了为什么后三段各只有 +230~+270 MiB：那是**新触碰的页**，不是新容量。
+原因是 **WASM 容量单调且不缩容**（F7）：tauG1 已经把容量池推到 1454.6 MiB，后面三段的需求
+（tauG2 的 1043 页、G1 @`2^18` 的 522 页）**只补增量、不重新分配**。
 
-> 对 M5 的直接含义：`resLagrange` 的容量账目**只需算 tauG1 的最大档**（988 页）；tauG2 的 1043 页是
-> 比它更高的一个点（+55 页/Worker ≈ +96 MiB），必须在 L2 里逐 Worker 核对，但**不是第二份 2351 MiB**。
+**A.2 稿在这里写错了两处，现按源码逐 Worker 更正**：
+
+1. "28 个 Worker 都到 988 页"不成立。p18 的 `resLagrange@2^19` 是 18 个位块 × **2 个** point-chunk
+   （337,042 点 + 187,246 点），首轮 28 个任务 = **18 个大分片 + 10 个尾部分片**，所以是
+   **18 个 Worker @988 页、10 个 @549 页**（`18×988 + 10×549 = 23,274` 页 = **1454.6 MiB**）。
+2. 因此 tauG2 的容量增量不是"28 × 55 页 ≈ 96 MiB"。tauG2@`2^18` 是 **19 个位块 × 2 个** point-chunk
+   （177,852 点 → 1043 页；84,292 点 → 494 页），首轮 19 个大分片落在 workers `0..18`：
+
+   | Worker | 之前 | 首轮接到 | 之后 | 增量 |
+   | ---: | ---: | ---: | ---: | ---: |
+   | 0–17（18 个） | 988 | 1043 页大分片 | 1043 | **+55** |
+   | 18（1 个） | 549 | 1043 页大分片 | 1043 | **+494** |
+   | 19–27（9 个） | 549 | 494 页尾部分片 | 549 | 0（494 < 549） |
+
+   `Δ池 = 18 × 55 + 494 = 1,484` 页 = **92.75 MiB**（`1,484 × 64 KiB = 97,255,424 B`）。
+   对照：若按"28 个 Worker 各 +55 页"计会得到 1,540 页 = 96.25 MiB，**多算 3.5 MiB 且归属错误**。
+
+> 对 M5 的直接含义：`resLagrange` 的容量账目要分两层看——**单 Worker 最大页数** 988 → 1043（tauG2 更高），
+> 而**容量池增量**只有 +92.75 MiB。两者不可混用；L2 必须逐 Worker 核对 `988/549/1043/494` 这四个值。
+> 实测 +266 MiB（r1，tauG2 段 WS 增量）与 92.75 MiB 不是同一量纲：前者含新触碰的页与页池，
+> 后者只是线性内存容量，**不得相互解释**。
+
 
 ### 5.7 外推
 
@@ -404,12 +477,32 @@ tm.processWorks();
 return M5_ON ? { __m5: snapshot, out: ctx.out } : ctx.out;   // 关闭时零差异
 ```
 
-### 7.3 任务上下文**在入队时绑定**（新增，防错标）
+### 7.3 任务上下文**在调用点显式绑定**（A.2 修正：不是只绑 MSM）
 
-`processWorks()` 是延迟调度的：任务的 `site` 若在发送时刻读"当前全局状态"，可能已被下一次 MSM 覆盖。
-因此 `queueAction` 入队时就写 `tm.m5.taskCtx[seq] = {task_id, call_id, site, send_bytes, n_points, s_scalar}`，
-`postAction` 与 `getOnMsg` **只用这份元数据**，不读全局。`call_id` 由每个 `_multiExp` 入口自增分配
-（`msm_plan` 事件带同一个 `call_id`），使 `task_send` ↔ `worker_task` ↔ `msm_plan` 三者可对齐。
+`processWorks()` 是延迟调度的：任务若在发送时刻读"当前全局状态"，它的 `site` 可能已被下一次调用覆盖。
+A.2 只描述了 `_multiExp` 内部生成 `call_id`，那不足以覆盖 `batchConvert` / `_fft` / `_fftJoinExt` /
+`fftJoin` / `fftFinal` / `batchLEMtoU`——它们同样走 `queueAction`，同样会延迟调度。
+
+因此改为**每个引擎入口各自建 ctx，逐层下传，入队时绑到任务上**：
+
+```js
+// engine_multiexp.js:91-137
+const ctx = m5.call('msm', {group: groupName, n_points: nPoints, s_scalar: sScalar,
+                            bit_chunk: bitChunkSize, n_bit: nChunks});
+for (let i = 0; i < nPoints; i += chunkSize) {
+    const sub = m5.derive(ctx, {pc_idx: i / chunkSize, points: n});
+    opPromises.push(_multiExpChunk(buffBasesChunk, buffScalarsChunk, inType, logger, logText, sub));
+}
+// _multiExpChunk -> G.tm.queueAction(task, undefined, m5.derive(sub, {bc_idx: i}))
+```
+
+- `m5.call()` 分配 `call_id` 并发一条 `*_plan` 事件；`m5.derive()` 只继承 `call_id` 与已定字段，不读全局。
+- `queueAction(actionData, transfers, ctx)` 第三参可选。`ctx` 为 `undefined` 时记 `site:'unlabeled'`
+  ——**snarkjs 自己在 `groth16_prove.js` / `zkey` 路径里内联构造的 task 属于这一类，必须被记录而不是被丢弃**。
+- `task_send` / `worker_task` 都只带这份 ctx 的拷贝，因此 `task_send ↔ worker_task ↔ *_plan` 用 `call_id` 对齐。
+- `batchConvert` 与 `_fft` 各自发**独立的 `batch_plan` / `fft_plan`**，字段含 `chunk_idx`、`chunk_points`、
+  `points_in_chunk`、`n_chunks`，使 L1 能逐任务核对"这个任务属于哪个 chunk"。
+
 
 ### 7.4 事件模型（JSONL）
 
@@ -417,8 +510,9 @@ return M5_ON ? { __m5: snapshot, out: ctx.out } : ctx.out;   // 关闭时零差�
 | --- | --- | --- |
 | `provenance` | 启动 | `resolved, sha256, patch_sha256, ffjavascript_version, node` |
 | `anchor` | 启动 | `epoch_ms, hr_ns, concurrency, page_bytes:65536, allocator_base_assumed` |
-| `msm_plan` | `_multiExp` 入口 | `call_id, site, p, n_points, s_scalar, bit_chunk, n_bit, n_point_chunk, chunk_pts[], slice_bytes` |
-| `fft_plan` | `_fft` 入口 | `op, p, n_points, bits, points_in_chunk, n_chunks, copy_bytes` |
+| `msm_plan` | `_multiExp` 入口 | `call_id, site, group, p, n_points, s_scalar, bit_chunk, n_bit, n_point_chunk, chunk_pts[]` |
+| `batch_plan` | `batchConvert` 入口 | `call_id, site, n_points, s_in, s_out, n_chunks, chunk_points[]` |
+| `fft_plan` | `_fft` 入口 | `call_id, op, p, n_points, bits, points_in_chunk, n_chunks, copy_bytes` |
 | `task_send` | `postAction` | `task_id, call_id, worker, site, send_bytes, inflight, queue_depth, ts` |
 | `task_done` | `getOnMsg` | `task_id, worker, svc_ms, inflight_after` |
 | `worker_task` | worker `runTask` 末尾 | `worker, task_id, call_id, alloc_base, wasm_before, wasm_after, alloc_top, grows, allocs[], grow_events[], allocset_bytes, get_bytes, w_heap_used, w_external, w_array_buffers` |
@@ -504,11 +598,12 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 
 ## 10. 风险与未解释项
 
-1. **模型不是测量**。§5 所有数字是"源码算术 + HYP-1（下界）/ HYP-2（上界）"，只有 §8 跑完才有结论权。
+1. **模型不是测量**。§5 所有数字是"源码算术 + `alloc_base = 0`"，只有 §8 跑完才有结论权。
 2. **初始 allocator 基址未知**（F20）。它是 **HYP-1 下界**的来源：真实基址只会抬高 `requiredPages`，
    不会降低；M5-B 用 `alloc_base` + 逐条回放替换它。
-3. **Worker 容量归属依赖调度顺序**（HYP-2）。1455 MiB 是**上界**（n 个大分片各占一个 Worker），
-   下界是"只有被大分片命中的 Worker 扩容"。**两者都不是实际情况**，实际值只能由 `worker_task.worker` 统计。
+3. **容量归属不再"依赖调度顺序"**（A.2 之后的补证，见 §5.0.1）：首轮映射由 `processWorks()` 的顺序扫描决定，
+   迟到任务对 p16/p18 的 445 次调用逐一证明无增长，所以 1455 MiB 是**条件于点预测**而非上界；
+   它唯一的不确定性来自 `alloc_base`。若探针发现首轮映射不是 `0..C-1`，说明 F8 的读法错了，须重做 §5。
 4. **V8 的 ArrayBuffer 回收不可观测**：`arrayBuffers` 只给当前持有量，给不出释放时刻。
 5. **WASM 容量 ≠ 驻留**：扩容但未写满的页可能不在 WS 里，H-B 只能证明"容量增长"。
 6. **`prepare_phase2` 的 920–1180 MiB 差额目前无法归属**，可能是未统计的缓冲、Worker 内存或外部内存；
@@ -518,42 +613,57 @@ L3 的残差不是"验收失败"，它就是 M5 的产出——用来判断模�
 9. **三个量纲不可互加**：在途字节（JS 副本）、WASM 容量（线性内存地址空间）、Working Set（驻留页集合）
    是三种不同的内存口径。可以**同刻并列**，可以各自单独与实测比，但**任何相加后宣称"预测 WS"的做法都禁止**
    （A.1 稿的 `776 + 2351 = 3127` 已删除，原因即此）。
-10. **账目 D 不抬高高水位但必须记录**：`batchTo/FromMontgomery` 在 p18 把每个干净 Worker 推到 28 页
-    （28 个 Worker 合计 49 MiB），但它在同一次 `verifyPower` 中晚于 `resTau`（165 页 / p16 42 页），
-    因此对峰值贡献为 0。写报告时必须同时给出这两个事实，不能只写"49 MiB"让人误读为增量。
-11. **阶段增量是单采样点，噪声不可忽略**：p18 同一段（phase-2 起始 → tauG2 标记）三次为
+10. **账目 D 是冷启动容量预算，不是本次运行的扩容事件**：`batchTo/FromMontgomery` 若从 25 页起跑，
+    p18 需要 28 页/Worker（28 个合计 49.0 MiB）；但它在 `resTau` 之后执行，那 28 页远低于已有容量
+    （165 / 55 页），**实际 grow 次数为 0、容量增量为 0**。写报告时必须同时给出"冷启动需要 28 页"与
+    "本次运行没有发生这次扩容"两个事实，不能只写"49 MiB"让人误读为增量。
+11. **阶段增量是单采样点，离散不可忽略**：p18 同一段（phase-2 起始 → tauG2 标记）三次为
     +2160 / +2487 / +2636（极差 476 MiB，±10%），p16 为 +194 / +207 / +238。
     任何引用段增量的地方必须给出三次读数与均值；**M4.1 文档里的 `+2160` 是 r1 的读数**，不得当作"该段的实测值"。
+    三次样本不足以支持统计意义上的"噪声"判断，故本文件不使用该措辞。
+12. **主线程 64 MiB 同时存活是假设 P-1，不是源码推论**：`BigBuffer.PAGE_SIZE = 1 GiB`，16 MiB 缓冲只占一页，
+    `slice()` 走 `Uint8Array.slice` 必然复制（累计 16 MiB/次）；但输入 / 分片 / GET 结果 / 输出四者
+    **是否同时存活**取决于 V8 回收时机，M5-D 用 `heap_sample.array_buffers` 判定。
 
 ---
 
-## 11. 评审门与后续
+## 11. 评审结论与 M5-B 实施清单
 
-**A.2 对三条评审意见的落实**（对应你上一轮的判断）：
+**A.2 评审裁定（已采纳，不再另开 A.3）**：
 
-| 你的意见 | 落实情况 | 位置 |
+| 待确认项 | 结论 | 落实位置 |
 | --- | --- | --- |
-| ① 三条账目还不完整，必须补 `batchTo/FromMontgomery`；28 页 / 49 MiB 不能漏 | **已补为账目 D**：两次分配 599,168 B、25→28 页、28 个 Worker 合计 49 MiB；并给出"晚于 `resTau`，故不抬高高水位"的绑定判断（p18 165 页 / p16 42 页） | §5.4 |
-| ② HYP-1/HYP-2 只能作边界假设 | 改为**下界 / 上界**两张边界表，明确"HYP-2 不代表实际调度顺序"与"两者都不是实际情况" | §5.0、§10.2-3 |
-| ③ 不接受 L2 的"基址偏移整页差"容差 | **删除容差**，改为从 `alloc_base` 起按 `allocs[]` 逐条回放、页数逐一精确相等；并说明为何可以要求精确相等 | §7.6、§7.4 |
-| ④ 3127 对 2936 的 6.5% 不能当吻合证据 | **删除该比较**；新增"三个量纲不可互加"的硬约束，L3 残差改为区间 | §5.6、§10.9 |
+| 账目 D：记录但不计入本次峰值增量 | **接受**，但改称"独立冷启动容量预算"，并给出"本次 grow 次数 = 0" | §5.4、§10.10 |
+| 撤回"模型是上界" | **接受**，最终措辞为"现有测量尚不能验证静态模型的准确性"；不再用"噪声大于信号" | §5.6、§10.11 |
+| L2 无容差精确回放 | **接受，作为 M5-B 硬门**：从真实 `alloc_base` 起按事件顺序回放，页数逐一相等，首个不符点定位到 `(worker, task_id, alloc_index)` | §7.6 |
+| §5.6.1 Worker 分布与容量增量 | **已按源码更正**：18@988 + 10@549；tauG2 `Δ池 = 18×55 + 494 = 1,484 页 = 92.75 MiB` | §5.6.1 |
+| 计算器须覆盖 G1/G2 与全部 power | **已补齐**：`--operation plan` 输出 445 次调用（p18）的完整计划，含 group / power / 切分 / 首轮页数 | `scripts/m5_budget.cjs` |
+| `queueAction` 须显式上下文绑定 | **M5-B 实现**（见下） | §7.3 已改为逐调用点传 ctx |
 
-**A.2 自行发现的两处问题**（你未提，但同样影响结论）：
+**M5-B 实施清单**（按依赖顺序；L1/L2 必须**先可执行**，才允许进入 M5-C）：
 
-- **单次 `+2160 MiB` 不可代表段增量**：三次为 2160 / 2487 / 2636（±10%），模型 2351 落在区间内（0.97×），
-  而 p16 为 2.8× —— **"模型是上界"不成立**，且该比较的噪声大于信号，不能用来判定模型对错。§5.6、§10.11
-- **`betaG2` 已闭合**（读 192 B、无 Worker、无 WASM）→ 上界 < 1 KiB，判为 0。§5.1
+1. `npm pack ffjavascript@0.3.1` → `vendor/ffjavascript-0.3.1-m5/`，记录 tarball sha256；在副本上打
+   `patches/m5-instrumentation.patch`，`node_modules` 保持出厂状态。
+2. **显式上下文绑定**（替代 A.2 的"只读全局"方案）：
+   - `_multiExp` 入口生成 `ctx = {call_id, site, kind:'msm', group, n_points, s_scalar, bit_chunk, n_bit}`，
+     下传给 `_multiExpChunk(..., ctx)`；每任务复制一份带 `pc_idx/bc_idx` 的派生 ctx。
+   - `batchConvert` 入口生成 `ctx = {call_id, site, kind:'batch', n_points, s_in, s_out, chunk_idx, chunk_points}`。
+   - `_fft` 入口生成 `ctx = {call_id, site, kind:'fft', n_points, bits, points_in_chunk, n_chunks}`。
+   - `_fftJoinExt` / `fftJoin` / `fftFinal` / `batchLEMtoU` 同样各自绑 ctx（它们也走 `queueAction`）。
+   - `queueAction(actionData, transfers, ctx)`：`ctx` 缺省时记 `site:'unlabeled'`（snarkjs 自己内联的
+     task 属于这一类，必须被记录而不是被忽略）。
+3. **BatchConvert / FFT 各自发独立的 `*_plan` 事件**，与 `task_send` / `worker_task` 用 `call_id` 对齐。
+4. **L1 可执行**：`scripts/m5_check_l1.cjs` 读 `--operation plan` 的 JSON 与探针的 `*_plan` 事件，
+   逐字段 diff（`n_points / s_scalar / bit_chunk / n_bit / chunk_pts / n_tasks`），先比**调用序列**再比字段；
+   任何不一致即以非零码退出并打印首次分歧的 `call_id` 与字段名。
+5. **L2 可执行**：`scripts/m5_check_l2.cjs` 读 `worker_task`，从 `alloc_base` 起按 `allocs[]` 回放，
+   逐条比对 `grow_events[]` 与 `wasm_after`；不允许任何容差。
+6. `scripts/m5_hook.cjs`（`--require`）+ `M5_CONFIG` 环境变量 + JSONL 落盘 + provenance 自证。
 
-**待你确认的三点**：
-
-1. 账目 D 的记法（"记录、但不计入峰值"）是否接受——我按"容量历史点 + 增量 0"处理，并在 §10.10 写了误读防护。
-2. "上界"身份撤回、改为"同量级且噪声大于信号"，是否作为 M5 结论的最终措辞。
-3. L2 的**无容差精确回放**是否作为 M5-B 的硬门（不通过则整次运行作废）。
-
-- **M5-B**：patch + resolve hook + provenance 自证 + 入队绑定 + `allocs[]`/`grow_events[]`，交付 `patches/m5-instrumentation.patch`。
-- **M5-C**：p10 smoke 过 L1 / L2（精确回放）+ 扰动预算。
+- **M5-C**：p10 smoke 过 L1 / L2 + 扰动预算（开关前后 peak WS 偏差与耗时偏差都要报）。
 - **M5-D**：p16/p18 交错对照，产出归因表与残差区间。
 - **M5-E**：写 `docs/M5_ATTRIBUTION.md`，届时**才**讨论 H1 / 并发 / 缓冲寿命的优先级；在此之前不写优化代码。
 
-> **边界声明**：A.2 是本项目**最后一次静态设计校准**。此后不再靠纸面预算推导内存峰值——所有数字要么来自
-> 探针，要么明确标注为"边界假设"。
+> **边界声明**：A.2 是本项目**最后一次静态设计校准**（本轮只做了评审勘误，不构成新修订）。此后不再靠纸面
+> 预算推导内存峰值——所有数字要么来自探针，要么明确标注为"边界假设"。
+
